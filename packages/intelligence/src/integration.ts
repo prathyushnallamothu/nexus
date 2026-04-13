@@ -23,6 +23,16 @@ export interface LearningIntegrationConfig extends LearnerConfig {
   skillsDir: string;
   /** LLM provider for reflection */
   provider: LLMProvider;
+  /** Enable System 1/2 routing */
+  enableRouter?: boolean;
+  /** System 1 confidence threshold */
+  system1Threshold?: number;
+  /** Wilson score lower threshold for trusted skills */
+  wilsonLowerThreshold?: number;
+  /** Maximum cost for System 1 execution */
+  maxSystem1Cost?: number;
+  /** Risk threshold for routing decisions */
+  riskThreshold?: number;
 }
 
 export interface AgentRunContext {
@@ -61,10 +71,10 @@ export class LearningIntegration {
     this.skillStore = new SkillStore(config.skillsDir);
     const evaluator = new SkillEvaluator(this.db, config.provider);
     this.learner = new ExperienceLearner(
-      this.db,
-      this.skillStore,
-      evaluator,
       config.provider,
+      this.skillStore,
+      this.db,
+      evaluator,
       config,
     );
 
@@ -72,13 +82,14 @@ export class LearningIntegration {
     if (config.enableRouter ?? true) {
       this.router = new DualProcessRouter(
         this.skillStore,
-        config.provider,
         {
-          system1Threshold: config.system1Threshold ?? 0.7,
-          wilsonLowerThreshold: config.wilsonLowerThreshold ?? 0.6,
-          maxSystem1Cost: config.maxSystem1Cost ?? 0.05,
-          riskThreshold: config.riskThreshold ?? 0.3,
+          confidenceThreshold: config.system1Threshold ?? 0.7,
+          riskThreshold: config.riskThreshold ?? 0.6,
+          minUsageForFastPath: 3,
+          minWilsonLower: config.wilsonLowerThreshold ?? 0.4,
+          debug: false,
         },
+        this.db,
       );
     }
   }
@@ -115,7 +126,7 @@ export class LearningIntegration {
    */
   async routeTask(task: string, projectId?: string): Promise<RoutingDecision | null> {
     if (!this.router) return null;
-    return this.router.route(task, projectId);
+    return this.router.route(task, projectId ? { projectId } : undefined);
   }
 
   /**

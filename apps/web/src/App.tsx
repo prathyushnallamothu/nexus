@@ -19,6 +19,7 @@ import {
   Cpu,
   Hash,
 } from 'lucide-react';
+// @ts-ignore - CSS import
 import './index.css';
 
 const API = 'http://localhost:8080';

@@ -5,7 +5,10 @@
 import chalk from "chalk";
 import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+
+// @ts-ignore - prompts types not available, will be resolved by @types/prompts
 import prompts from "prompts";
+
 import { NEXUS_HOME } from "./config.js";
 
 // ── Types ─────────────────────────────────────────────────────

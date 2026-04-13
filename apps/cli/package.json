@@ -23,6 +23,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/prompts": "^2.4.9",
     "typescript": "^5.7.0"
   }
 }

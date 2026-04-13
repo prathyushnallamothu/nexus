@@ -191,7 +191,7 @@ const injectionCases: Array<{ input: string; expectBlocked: boolean; label: stri
 ];
 
 for (const tc of injectionCases) {
-  const result = firewall.scanInput(tc.input);
+  const result = await firewall.scanInput(tc.input);
   const wasBlocked = result.blocked;
   const correct = wasBlocked === tc.expectBlocked;
   record({
