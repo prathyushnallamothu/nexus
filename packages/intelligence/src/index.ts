@@ -73,3 +73,10 @@ export {
   type InstallResult,
   type RegistrySkill,
 } from "./skills-io.js";
+
+// Integration — wires learning into agent execution
+export {
+  LearningIntegration,
+  type LearningIntegrationConfig,
+  type AgentRunContext,
+} from "./integration.js";

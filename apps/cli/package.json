@@ -18,7 +18,8 @@
     "@nexus/runtime": "*",
     "chalk": "^5.4.0",
     "dotenv": "^16.4.0",
-    "ora": "^8.0.0"
+    "ora": "^8.0.0",
+    "prompts": "^2.4.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

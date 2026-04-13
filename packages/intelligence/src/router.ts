@@ -230,6 +230,7 @@ export class System1Executor {
     userMessage: string,
     match: SkillMatch,
     tools: Tool[],
+    opts?: { bypassGates?: boolean },
   ): Promise<{ response: string; costUsd: number; durationMs: number; toolsUsed: string[] }> {
     const startTime = Date.now();
     const toolsUsed: string[] = [];
@@ -268,6 +269,7 @@ export class System1Executor {
         const tool = tools.find((t) => t.schema.name === call.name);
         let result: string;
         try {
+          console.log(`  🔧 ${call.name}...`);
           result = tool ? await tool.execute(call.arguments) : `Tool "${call.name}" not found`;
         } catch (error) {
           result = `Error: ${error instanceof Error ? error.message : String(error)}`;

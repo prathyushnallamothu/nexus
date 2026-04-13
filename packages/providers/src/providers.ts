@@ -111,19 +111,26 @@ class AnthropicProvider implements LLMProvider {
       messages: convMessages,
     };
 
+    // Add cache_control to system prompt (static content)
     if (systemMsg) {
-      body.system = systemMsg.content;
+      body.system = {
+        type: "text",
+        text: systemMsg.content,
+        cache_control: { type: "ephemeral" },
+      };
     }
 
     if (options?.temperature !== undefined) {
       body.temperature = options.temperature;
     }
 
+    // Add cache_control to tools (static schemas)
     if (tools.length > 0) {
       body.tools = tools.map((t) => ({
         name: t.name,
         description: t.description,
         input_schema: t.parameters,
+        cache_control: { type: "ephemeral" },
       }));
     }
 

@@ -11,7 +11,7 @@ import chalk from "chalk";
 import type { Message, Tool } from "@nexus/core";
 import type { McpManager, McpConfigStore } from "@nexus/protocols";
 import type { CronStore } from "@nexus/runtime";
-import type { SkillStore, DualProcessRouter, ExperienceLearner, LearningDB } from "@nexus/intelligence";
+import type { SkillStore, DualProcessRouter, ExperienceLearner, LearningDB, MemoryManager, ModeManager } from "@nexus/intelligence";
 import type { AuditLogger, ApprovalQueue, PolicyEngine, BudgetStore, BudgetHistory, IdentityManager } from "@nexus/governance";
 import type { SandboxManager } from "@nexus/runtime";
 import { handleSlashCommand, type SlashCommandContext } from "./commands.js";
@@ -28,6 +28,8 @@ export interface ReplDeps extends ProcessorDeps {
   router: DualProcessRouter;
   learner: ExperienceLearner;
   learningDb?: LearningDB;
+  memoryManager?: MemoryManager;
+  modeManager: ModeManager;
   auditLogger: AuditLogger;
   approvalQueue?: ApprovalQueue;
   policyEngine?: PolicyEngine;
@@ -68,6 +70,12 @@ export function startRepl(deps: ReplDeps): RLInterface {
         messages: sessionMessages,
       };
       saveSession(NEXUS_HOME, session);
+
+      // Extract semantic facts from session (background, non-blocking)
+      if (deps.memoryManager) {
+        const userContents = userMsgs.map((m) => m.content);
+        deps.memoryManager.extractAndStoreFacts(userContents, sessionId).catch(() => {});
+      }
     } catch {
       // Non-critical
     }
@@ -102,12 +110,21 @@ export function startRepl(deps: ReplDeps): RLInterface {
     }
   }
 
-  const processMessage = createProcessor(deps, sessionMessages, drainOrPrompt);
+  const processor = createProcessor({
+    agent: deps.agent,
+    allTools: deps.allTools,
+    router: deps.router,
+    system1: deps.system1,
+    learner: deps.learner,
+    modeManager: deps.modeManager,
+    memoryManager: deps.memoryManager,
+    skillStore: deps.skillStore,
+  }, sessionMessages, drainOrPrompt);
 
   function doProcess(input: string): void {
     processing = true;
     lastUserInput = input;
-    processMessage(input);
+    processor(input);
   }
 
   // ── Slash command context ─────────────────────────────
@@ -119,6 +136,7 @@ export function startRepl(deps: ReplDeps): RLInterface {
     router: deps.router,
     learner: deps.learner,
     learningDb: deps.learningDb,
+    memoryManager: deps.memoryManager,
     auditLogger: deps.auditLogger,
     approvalQueue: deps.approvalQueue,
     policyEngine: deps.policyEngine,
@@ -162,7 +180,18 @@ export function startRepl(deps: ReplDeps): RLInterface {
 
     if (input.startsWith("/")) {
       handleSlashCommand(input, slashCtx).then((shouldPrompt) => {
-        if (shouldPrompt) rl.prompt();
+        if (shouldPrompt) {
+          rl.prompt();
+        } else {
+          // Slash command returned false - it's a skill activation, pass to processor
+          if (processing) {
+            messageQueue.push(input);
+            console.log(chalk.dim(`  ⏎ Queued (agent busy, ${messageQueue.length} pending)\n`));
+            rl.prompt();
+          } else {
+            doProcess(input);
+          }
+        }
       });
       return;
     }

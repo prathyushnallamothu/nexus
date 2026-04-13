@@ -6,7 +6,7 @@ import chalk from "chalk";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import type { Message } from "@nexus/core";
-import type { SkillStore, DualProcessRouter, ExperienceLearner, LearningDB } from "@nexus/intelligence";
+import type { SkillStore, DualProcessRouter, ExperienceLearner, LearningDB, MemoryManager } from "@nexus/intelligence";
 import { GitHubSkillInstaller, SkillsDirScanner, SkillsShClient, installFromFile } from "@nexus/intelligence";
 import { writeFileSync } from "node:fs";
 import type { AuditLogger } from "@nexus/governance";
@@ -32,6 +32,7 @@ export interface SlashCommandContext {
   router: DualProcessRouter;
   learner: ExperienceLearner;
   learningDb?: LearningDB;
+  memoryManager?: MemoryManager;
   auditLogger: AuditLogger;
   mcpManager: McpManager | null;
   mcpConfigStore: McpConfigStore | null;
@@ -977,24 +978,17 @@ function cmdAudit(parts: string[], ctx: SlashCommandContext): void {
 
 // ── /memory ──────────────────────────────────────────────
 
-function cmdMemory(): void {
-  const memFile = join(NEXUS_HOME, "memory", "semantic.json");
-  const episodicFile = join(NEXUS_HOME, "memory", "episodic.json");
-  let semanticCount = 0;
-  let episodicCount = 0;
-  try {
-    if (existsSync(memFile)) {
-      const data = JSON.parse(readFileSync(memFile, "utf-8"));
-      semanticCount = Array.isArray(data) ? data.length : 0;
-    }
-    if (existsSync(episodicFile)) {
-      const data = JSON.parse(readFileSync(episodicFile, "utf-8"));
-      episodicCount = Array.isArray(data) ? data.length : 0;
-    }
-  } catch {}
-  console.log(chalk.cyan("\n  Memory:\n"));
-  console.log(chalk.dim(`  Semantic facts:   ${semanticCount}`));
-  console.log(chalk.dim(`  Episodic records: ${episodicCount}`));
+function cmdMemory(ctx: SlashCommandContext): void {
+  if (!ctx.memoryManager) {
+    console.log(chalk.yellow("\n  Memory manager not available"));
+    return;
+  }
+
+  const stats = ctx.memoryManager.getStats();
+  console.log(chalk.cyan("\n  Memory Store Stats"));
+  console.log(chalk.dim(`  Semantic facts: ${stats.semanticFacts}`));
+  console.log(chalk.dim(`  Episodic records: ${stats.episodicRecords}`));
+  console.log(chalk.dim(`  Outcomes: ${stats.episodicOutcomes.successes} success, ${stats.episodicOutcomes.failures} failure, ${stats.episodicOutcomes.partials} partial`));
   console.log(chalk.dim(`  Store location:   ${join(NEXUS_HOME, "memory")}\n`));
 }
 
@@ -1495,7 +1489,7 @@ export async function handleSlashCommand(input: string, ctx: SlashCommandContext
       return true;
 
     case "/memory":
-      cmdMemory();
+      cmdMemory(ctx);
       return true;
 
     case "/sandbox":
@@ -1539,6 +1533,14 @@ export async function handleSlashCommand(input: string, ctx: SlashCommandContext
       process.exit(0);
 
     default:
+      // Check if this is an explicit skill activation (e.g., /skill-name)
+      const skillName = cmd.slice(1).toLowerCase();
+      const allSkills = ctx.skillStore.getAll({ status: "trusted" });
+      const skill = allSkills.find((s) => s.name.toLowerCase() === skillName || s.triggers.includes(skillName));
+      if (skill) {
+        // Pass through to agent-runner for explicit skill activation
+        return false;
+      }
       console.log(chalk.red(`  Unknown command: ${cmd}\n`));
       return true;
   }

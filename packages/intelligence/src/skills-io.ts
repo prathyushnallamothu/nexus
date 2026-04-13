@@ -359,45 +359,65 @@ export class GitHubSkillInstaller {
 
   /**
    * Discover multiple SKILL.md files in a repo's skills directory.
+   * Recursively searches subdirectories for SKILL.md files.
    */
   private async listSkillsViaApi(org: string, repo: string, branch: string): Promise<InstallResult[]> {
     const results: InstallResult[] = [];
 
     for (const dir of [".agents/skills", ".claude/skills", "skills"]) {
       try {
-        const apiUrl = `${GITHUB_API}/repos/${org}/${repo}/contents/${dir}?ref=${branch}`;
-        const resp = await fetch(apiUrl, {
-          headers: {
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "nexus-agent/1.0",
-            ...(process.env.GITHUB_TOKEN ? { "Authorization": `token ${process.env.GITHUB_TOKEN}` } : {}),
-          },
-          signal: AbortSignal.timeout(this.timeout),
-        });
-
-        if (!resp.ok) continue;
-        const files = await resp.json() as Array<{ name: string; type: string; download_url: string }>;
-
-        for (const f of files) {
-          if (f.type === "file" && f.name.endsWith(".md")) {
-            try {
-              const content = await this.fetchText(f.download_url);
-              if (content) {
-                const parsed = parseSkillMd(content, f.download_url);
-                const skill = skillMdToNexus(parsed, {
-                  importedFrom: `github:${org}/${repo}`,
-                });
-                results.push({ skill, source: f.download_url, parsed });
-              }
-            } catch { /* skip */ }
-          }
-        }
-
+        await this.recursiveListFiles(org, repo, dir, branch, results);
         if (results.length > 0) break;
       } catch { /* try next dir */ }
     }
 
     return results;
+  }
+
+  /**
+   * Recursively list files in a GitHub directory, finding all SKILL.md files.
+   */
+  private async recursiveListFiles(
+    org: string,
+    repo: string,
+    path: string,
+    branch: string,
+    results: InstallResult[],
+  ): Promise<void> {
+    try {
+      const apiUrl = `${GITHUB_API}/repos/${org}/${repo}/contents/${path}?ref=${branch}`;
+      const resp = await fetch(apiUrl, {
+        headers: {
+          "Accept": "application/vnd.github.v3+json",
+          "User-Agent": "nexus-agent/1.0",
+          ...(process.env.GITHUB_TOKEN ? { "Authorization": `token ${process.env.GITHUB_TOKEN}` } : {}),
+        },
+        signal: AbortSignal.timeout(this.timeout),
+      });
+
+      if (!resp.ok) return;
+      const items = await resp.json() as Array<{ name: string; type: string; path: string; download_url?: string }>;
+
+      for (const item of items) {
+        if (item.type === "file" && item.name.endsWith(".md")) {
+          if (item.download_url) {
+            try {
+              const content = await this.fetchText(item.download_url);
+              if (content) {
+                const parsed = parseSkillMd(content, item.download_url);
+                const skill = skillMdToNexus(parsed, {
+                  importedFrom: `github:${org}/${repo}`,
+                });
+                results.push({ skill, source: item.download_url, parsed });
+              }
+            } catch { /* skip */ }
+          }
+        } else if (item.type === "dir") {
+          // Recursively search subdirectories
+          await this.recursiveListFiles(org, repo, item.path, branch, results);
+        }
+      }
+    } catch { /* skip errors */ }
   }
 
   private async fetchText(url: string): Promise<string | null> {

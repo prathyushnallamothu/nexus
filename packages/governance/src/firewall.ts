@@ -6,9 +6,46 @@
  *
  * This expands on the basic promptFirewall() in core/middleware.ts
  * with multi-layer detection, configurable policies, and audit integration.
+ *
+ * Supports optional ML-based detection following the Goose pattern.
  */
 
 import type { Middleware, AgentContext, NextFn } from "@nexus/core";
+
+// ── ML Detection Interface ────────────────────────────────
+
+export interface MLClassifier {
+  classify(input: string): Promise<{ isMalicious: boolean; confidence: number; label?: string }>;
+}
+
+/**
+ * Simple heuristic-based ML classifier fallback.
+ * In production, this would call an external ML service or load a local model.
+ */
+class HeuristicMLClassifier implements MLClassifier {
+  async classify(input: string): Promise<{ isMalicious: boolean; confidence: number; label?: string }> {
+    const lower = input.toLowerCase();
+    const suspiciousPatterns = [
+      /ignore\s+(all\s+)?(?:previous|prior|above)\s+instructions/i,
+      /you\s+are\s+now\s+(a\s+)?(?:evil|unrestricted|jailbroken|DAN)/i,
+      /jailbreak|do anything now|pretend you have no restrictions/i,
+      /system\s*:\s*override/i,
+      /important:\s*(?:new|override|forget|ignore)/i,
+    ];
+
+    let matchCount = 0;
+    for (const pattern of suspiciousPatterns) {
+      if (pattern.test(lower)) matchCount++;
+    }
+
+    const confidence = Math.min(matchCount * 0.25, 0.95);
+    return {
+      isMalicious: matchCount >= 2,
+      confidence,
+      label: matchCount >= 2 ? "prompt_injection" : undefined,
+    };
+  }
+}
 
 // ── Injection Detection ───────────────────────────────────
 
@@ -168,11 +205,15 @@ export class PromptFirewall {
   private leakagePatterns: LeakagePattern[];
   private blockList: Set<string> = new Set();
   private violations: Array<{ timestamp: number; type: string; pattern: string; content: string }> = [];
+  private mlClassifier: MLClassifier | null = null;
+  private mlEnabled: boolean = false;
 
   constructor(opts?: {
     additionalInjectionPatterns?: InjectionPattern[];
     additionalLeakagePatterns?: LeakagePattern[];
     blockList?: string[];
+    mlClassifier?: MLClassifier;
+    enableML?: boolean;
   }) {
     this.injectionPatterns = [
       ...DEFAULT_INJECTION_PATTERNS,
@@ -185,18 +226,50 @@ export class PromptFirewall {
     for (const item of opts?.blockList ?? []) {
       this.blockList.add(item.toLowerCase());
     }
+    this.mlClassifier = opts?.mlClassifier ?? new HeuristicMLClassifier();
+    this.mlEnabled = opts?.enableML ?? false;
+  }
+
+  /** Enable or disable ML-based detection at runtime */
+  setMLEnabled(enabled: boolean): void {
+    this.mlEnabled = enabled;
+  }
+
+  /** Set a custom ML classifier */
+  setMLClassifier(classifier: MLClassifier): void {
+    this.mlClassifier = classifier;
   }
 
   /**
    * Scan an input message for prompt injection attempts.
+   * Uses ML classifier when enabled, otherwise falls back to regex patterns.
    */
-  scanInput(content: string): FirewallResult {
-    // Check block list
+  async scanInput(content: string): Promise<FirewallResult> {
+    // Check block list first (always enabled)
     const lower = content.toLowerCase();
     for (const blocked of this.blockList) {
       if (lower.includes(blocked)) {
         this._recordViolation("blocklist", blocked, content);
         return { blocked: true, reason: "Content matches block list", matchedPattern: blocked, severity: "high" };
+      }
+    }
+
+    // ML-based detection if enabled
+    if (this.mlEnabled && this.mlClassifier) {
+      try {
+        const mlResult = await this.mlClassifier.classify(content);
+        if (mlResult.isMalicious) {
+          this._recordViolation("ml_detection", mlResult.label || "unknown", content);
+          return {
+            blocked: true,
+            reason: `ML classifier detected ${mlResult.label || "malicious"} content (confidence: ${(mlResult.confidence * 100).toFixed(0)}%)`,
+            matchedPattern: mlResult.label,
+            severity: "critical",
+          };
+        }
+      } catch (error) {
+        // ML classifier failed - fall back to regex patterns
+        console.warn(`ML classifier failed, falling back to regex patterns: ${error}`);
       }
     }
 
@@ -291,7 +364,7 @@ export function firewallMiddleware(
       const lastUserMsg = [...ctx.messages].reverse().find((m) => m.role === "user");
 
       if (lastUserMsg) {
-        const inputResult = fw.scanInput(lastUserMsg.content);
+        const inputResult = await fw.scanInput(lastUserMsg.content);
 
         if (inputResult.blocked && blockOnDetection) {
           ctx.meta["firewall_blocked"] = true;

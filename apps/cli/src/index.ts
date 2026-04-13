@@ -31,6 +31,7 @@ import {
   ModeManager,
   LearningDB,
   SkillEvaluator,
+  MemoryManager,
 } from "@nexus/intelligence";
 import {
   AuditLogger,
@@ -65,6 +66,7 @@ import {
   validateConfig,
   writeStructuredLog,
 } from "./diagnostics.js";
+import { runSetupWizard, applyWizardConfig } from "./wizard.js";
 import { createCombinedHandler } from "./events.js";
 import { printBanner } from "./banner.js";
 import { startRepl } from "./repl.js";
@@ -87,6 +89,7 @@ const learner     = new ExperienceLearner(provider, skillStore, learningDb, eval
   retirementSuccessThreshold: 0.4,
 });
 const system1     = new System1Executor(provider);
+const memoryManager = new MemoryManager(join(NEXUS_HOME, "memory"), provider);
 
 // ── Governance Layer ──────────────────────────────────────
 
@@ -237,6 +240,7 @@ async function main(): Promise<void> {
     modeManager,
     skillStore,
     learningDb,
+    memoryManager,
     auditLogger,
     approvalQueue,
     policyEngine,
@@ -265,8 +269,13 @@ if (command === "doctor") {
   printDoctorReport(checks);
   process.exit(hasBlockingConfigIssue(checks) ? 1 : 0);
 } else if (command === "setup" || command === "onboard") {
-  printSetupReport();
-  process.exit(0);
+  // Run interactive setup wizard
+  runSetupWizard()
+    .then((config) => applyWizardConfig(config))
+    .catch((err) => {
+      console.error(chalk.red(`Setup failed: ${err instanceof Error ? err.message : String(err)}`));
+      process.exit(1);
+    });
 } else {
   main().catch((err) => {
     writeStructuredLog("error", "cli.fatal", {
