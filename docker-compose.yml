@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  # PostgreSQL for Sessions, Budgets, and Event Bus
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus_password
+      POSTGRES_DB: nexus_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - nexus-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexus_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for upstash/caching and bullmq event bus queues
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - nexus-cache:/data
+
+volumes:
+  nexus-data:
+  nexus-cache:

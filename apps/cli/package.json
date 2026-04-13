@@ -1,0 +1,24 @@
+{
+  "name": "@nexus/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target node"
+  },
+  "dependencies": {
+    "@nexus/core": "*",
+    "@nexus/governance": "*",
+    "@nexus/intelligence": "*",
+    "@nexus/providers": "*",
+    "@nexus/runtime": "*",
+    "chalk": "^5.4.0",
+    "dotenv": "^16.4.0",
+    "ora": "^8.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

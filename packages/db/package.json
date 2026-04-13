@@ -1,0 +1,11 @@
+{
+  "name": "@nexus/db",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/schema.ts",
+  "types": "src/schema.ts",
+  "dependencies": {
+    "drizzle-orm": "^0.30.0",
+    "pg": "^8.11.0"
+  }
+}

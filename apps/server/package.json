@@ -1,0 +1,18 @@
+{
+  "name": "@nexus/server",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts"
+  },
+  "dependencies": {
+    "hono": "^4.1.0",
+    "@nexus/core": "*",
+    "@nexus/gateway": "*",
+    "@nexus/providers": "*",
+    "@nexus/intelligence": "*",
+    "@nexus/governance": "*",
+    "@nexus/protocols": "*",
+    "@nexus/runtime": "*"
+  }
+}
