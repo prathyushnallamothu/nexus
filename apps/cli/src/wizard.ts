@@ -154,14 +154,13 @@ export async function runSetupWizard(): Promise<WizardConfig> {
 
   // Step 2: API Key Configuration
   console.log(chalk.yellow("\n  Step 2/5: Configure API key\n"));
-  
   if (providerInfo.envKey) {
     const existingKey = process.env[providerInfo.envKey];
     const hasExistingKey = !!existingKey;
 
     if (hasExistingKey) {
       console.log(chalk.green(`  ✓ Found existing ${providerInfo.envKey} in environment`));
-      
+
       const useExisting = await prompts({
         type: "confirm",
         name: "useExisting",
@@ -181,7 +180,7 @@ export async function runSetupWizard(): Promise<WizardConfig> {
       }
     } else {
       console.log(chalk.dim(`  ${providerInfo.envKey} not found in environment`));
-      
+
       const apiKey = await prompts({
         type: "password",
         name: "key",
@@ -258,7 +257,7 @@ export async function runSetupWizard(): Promise<WizardConfig> {
 
   config.budget = budgetChoice.budget;
 
-  // Step 5: Optional Features
+  // Step 5: Optional features
   console.log(chalk.yellow("\n  Step 5/5: Optional features\n"));
   
   // Platform setup (currently informational since gateway not implemented)
@@ -344,7 +343,7 @@ export async function applyWizardConfig(config: WizardConfig): Promise<void> {
   if (config.createEnv && config.apiKey) {
     const providerInfo = PROVIDERS[config.provider];
     const envPath = resolve(process.cwd(), ".env");
-    
+
     let envContent = "";
     if (existsSync(envPath)) {
       envContent = readFileSync(envPath, "utf-8");

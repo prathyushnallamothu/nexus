@@ -9,7 +9,7 @@
 Nexus is an autonomous AI agent that learns from every task. Unlike coding copilots tethered to an IDE or chatbot wrappers around a single API, Nexus uses a **dual-process architecture** that continuously improves:
 
 - **Task #1**: Full reasoning → $0.15, 3 minutes
-- **Task #100**: Skill match → $0.04, 45 seconds  
+- **Task #100**: Skill match → $0.04, 45 seconds
 - **Task #1000**: Internalized → $0.01, 10 seconds
 
 Nexus runs locally or on any infrastructure, supports every major LLM provider, and builds a persistent knowledge base that compounds across sessions.

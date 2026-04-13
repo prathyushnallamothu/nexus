@@ -165,13 +165,12 @@ import type { Middleware } from "@nexus/core";
 const customMiddleware: Middleware = async (context, next) => {
   // Before agent logic
   console.log("Before agent:", context);
-  
+
   // Call next middleware
   const result = await next(context);
-  
+
   // After agent logic
   console.log("After agent:", result);
-  
   return result;
 };
 ```

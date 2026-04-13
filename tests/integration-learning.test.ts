@@ -20,7 +20,7 @@ import { rmSync } from "fs";
 // Mock LLM provider for testing
 class MockLLMProvider implements LLMProvider {
   name = "mock";
-  
+
   async complete(
     messages: Message[],
     tools: ToolSchema[],
@@ -49,7 +49,7 @@ class MockLLMProvider implements LLMProvider {
     }
     return { content: "Mock response", toolCalls: [], usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.0001 } };
   }
-  
+
   estimateCost(tokensIn: number, tokensOut: number): number {
     return (tokensIn + tokensOut) * 0.00001;
   }
@@ -185,11 +185,11 @@ describe("Learning Integration", () => {
 
     await learning.afterAgentRun(mockContext);
     const skills = learning.getSkills();
-    
+
     if (skills.length > 0) {
       const approved = await learning.approveSkillManually(skills[0].id, "Manual approval test");
       expect(approved).toBe(true);
-      
+
       const updatedSkills = learning.getSkills();
       expect(updatedSkills[0]?.status).toBe("trusted");
     }
@@ -220,11 +220,11 @@ describe("Learning Integration", () => {
 
     await learning.afterAgentRun(mockContext);
     const skills = learning.getSkills();
-    
+
     if (skills.length > 0) {
       const retired = learning.retireSkill(skills[0].id, "Test retirement");
       expect(retired).toBe(true);
-      
+
       const updatedSkills = learning.getSkills();
       expect(updatedSkills[0]?.status).toBe("retired");
     }
