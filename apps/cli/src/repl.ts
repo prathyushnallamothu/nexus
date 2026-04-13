@@ -12,7 +12,8 @@ import type { Message, Tool } from "@nexus/core";
 import type { McpManager, McpConfigStore } from "@nexus/protocols";
 import type { CronStore } from "@nexus/runtime";
 import type { SkillStore, DualProcessRouter, ExperienceLearner, LearningDB } from "@nexus/intelligence";
-import type { AuditLogger } from "@nexus/governance";
+import type { AuditLogger, ApprovalQueue, PolicyEngine, BudgetStore, BudgetHistory, IdentityManager } from "@nexus/governance";
+import type { SandboxManager } from "@nexus/runtime";
 import { handleSlashCommand, type SlashCommandContext } from "./commands.js";
 import { createProcessor, type ProcessorDeps } from "./agent-runner.js";
 import {
@@ -28,9 +29,15 @@ export interface ReplDeps extends ProcessorDeps {
   learner: ExperienceLearner;
   learningDb?: LearningDB;
   auditLogger: AuditLogger;
+  approvalQueue?: ApprovalQueue;
+  policyEngine?: PolicyEngine;
+  budgetStore?: BudgetStore;
+  budgetHistory?: BudgetHistory;
+  identityManager?: IdentityManager;
   mcpManager: McpManager | null;
   mcpConfigStore: McpConfigStore | null;
   cronStore: CronStore | null;
+  sandboxManager?: SandboxManager;
   onShutdown: () => Promise<void>;
 }
 
@@ -113,9 +120,15 @@ export function startRepl(deps: ReplDeps): RLInterface {
     learner: deps.learner,
     learningDb: deps.learningDb,
     auditLogger: deps.auditLogger,
+    approvalQueue: deps.approvalQueue,
+    policyEngine: deps.policyEngine,
+    budgetStore: deps.budgetStore,
+    budgetHistory: deps.budgetHistory,
+    identityManager: deps.identityManager,
     mcpManager: deps.mcpManager,
     mcpConfigStore: deps.mcpConfigStore,
     cronStore: deps.cronStore,
+    sandboxManager: deps.sandboxManager,
     onRetry(input: string) {
       doProcess(input);
     },

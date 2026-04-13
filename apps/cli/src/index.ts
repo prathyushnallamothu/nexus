@@ -34,15 +34,25 @@ import {
 } from "@nexus/intelligence";
 import {
   AuditLogger,
+  AuditDB,
   PermissionGuard,
   DynamicSupervisor,
   BehavioralMonitor,
+  PolicyEngine,
+  PolicyStore,
+  ApprovalQueue,
+  BudgetStore,
+  BudgetHistory,
+  IdentityManager,
+  NetworkGuard,
+  createInteractiveSupervisor,
   permissionMiddleware,
   supervisionMiddleware,
   monitorMiddleware,
+  networkMiddleware,
 } from "@nexus/governance";
 import { McpConfigStore, McpManager, createMcpManagementTools } from "@nexus/protocols";
-import { CronStore, CronRunner, createCronTools } from "@nexus/runtime";
+import { CronStore, CronRunner, createCronTools, createSandboxManager } from "@nexus/runtime";
 import type { CronJob, CronRunResult } from "@nexus/runtime";
 import { initWikiTools } from "@nexus/core";
 
@@ -80,20 +90,37 @@ const system1     = new System1Executor(provider);
 
 // ── Governance Layer ──────────────────────────────────────
 
-const auditLogger     = new AuditLogger(join(NEXUS_HOME, "audit"));
+const govDir         = join(NEXUS_HOME, "governance");
+const auditDb        = new AuditDB(join(govDir, "audit.db"));
+const auditLogger    = new AuditLogger(join(NEXUS_HOME, "audit"), undefined, auditDb);
 const permissionGuard = new PermissionGuard(process.cwd());
+const policyEngine   = new PolicyEngine(NEXUS_HOME);
+const approvalQueue  = new ApprovalQueue(join(govDir, "approvals.db"), { defaultChannel: "cli" });
+const budgetStore    = new BudgetStore(join(govDir, "budgets"));
+const budgetHistory  = new BudgetHistory(join(govDir, "budgets"));
+const identityMgr    = new IdentityManager(join(govDir, "identities.json"));
+const networkGuard   = new NetworkGuard({ denyPrivateRanges: true });
 
-const supervisor = new DynamicSupervisor({
-  onApprovalNeeded: async (decision) => {
-    console.log(chalk.bgRed.white(`\n  ✋ HITL Required: ${decision.reason}  `));
-    console.log(chalk.red(`  └─ Tool: ${decision.toolName} (Auto-denied in REPL mode)`));
-    return false;
-  },
-});
+// Resolve current user — auto-detect from git/env/OS
+const currentIdentity = identityMgr.resolve();
+
+// Approval-backed supervisor — interactive CLI prompt for HITL
+const supervisor = createInteractiveSupervisor(approvalQueue, "cli");
 
 const monitor = new BehavioralMonitor({}, (alert) => {
   process.stderr.write(chalk.yellow(`  🚨 ALERT: ${alert.message}\n`));
 });
+
+// ── Sandbox Layer ─────────────────────────────────────────
+
+const sandboxManager = createSandboxManager({
+  nexusHome: NEXUS_HOME,
+  onEvent: (event) => {
+    const taskId = event.type === "created" ? event.handle.taskId : (event as any).taskId ?? "?";
+    process.stderr.write(chalk.dim(`  [sandbox] ${event.type} task=${taskId}\n`));
+  },
+});
+sandboxManager.start();
 
 // ── Main ──────────────────────────────────────────────────
 
@@ -159,6 +186,7 @@ async function main(): Promise<void> {
         memoryContextBuilder({ nexusHome: NEXUS_HOME }),
         budgetEnforcer({ limitUsd: BUDGET_USD }),
         permissionMiddleware(permissionGuard),
+        networkMiddleware(networkGuard),
         supervisionMiddleware(supervisor),
         artifactTracker(),          // record files/commands/URLs as artifacts
         toolCompactor(),            // truncate huge tool outputs before they blow context
@@ -210,12 +238,20 @@ async function main(): Promise<void> {
     skillStore,
     learningDb,
     auditLogger,
+    approvalQueue,
+    policyEngine,
+    budgetStore,
+    budgetHistory,
+    identityManager: identityMgr,
     mcpManager,
     mcpConfigStore,
     cronStore,
+    sandboxManager,
     onShutdown: async () => {
       cronRunner.stop();
+      await sandboxManager.stop();
       learningDb.close();
+      auditDb.close();
       await mcpManager.disconnectAll().catch(() => {});
     },
   });

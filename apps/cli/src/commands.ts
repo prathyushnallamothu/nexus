@@ -17,6 +17,14 @@ import { listSessions, loadSessionById, type SessionMeta } from "./session.js";
 import { DEFAULT_MODEL, BUDGET_USD, NEXUS_HOME } from "./config.js";
 import { printDoctorReport, printSetupReport, validateConfig } from "./diagnostics.js";
 
+// Lazy-import governance types (modules may not be built yet)
+type ApprovalQueue = import("@nexus/governance").ApprovalQueue;
+type PolicyEngine = import("@nexus/governance").PolicyEngine;
+type BudgetStore = import("@nexus/governance").BudgetStore;
+type BudgetHistory = import("@nexus/governance").BudgetHistory;
+type IdentityManager = import("@nexus/governance").IdentityManager;
+type SandboxManager = import("@nexus/runtime").SandboxManager;
+
 export interface SlashCommandContext {
   sessionMessages: Message[];
   lastUserInput: string;
@@ -28,6 +36,13 @@ export interface SlashCommandContext {
   mcpManager: McpManager | null;
   mcpConfigStore: McpConfigStore | null;
   cronStore: CronStore | null;
+  // Governance extensions
+  approvalQueue?: ApprovalQueue;
+  policyEngine?: PolicyEngine;
+  budgetStore?: BudgetStore;
+  budgetHistory?: BudgetHistory;
+  identityManager?: IdentityManager;
+  sandboxManager?: SandboxManager;
   // Callbacks
   onRetry: (input: string) => void;
   onLoadSession: (messages: Message[]) => void;
@@ -53,10 +68,13 @@ function cmdHelp(): void {
   console.log(chalk.dim("  /thumbsdown     Mark last response as failed (updates learning)"));
   console.log(chalk.dim("  /modes          (set in modes/ directory)"));
   console.log(chalk.dim("  /stats          Show routing & learning stats"));
-  console.log(chalk.dim("  /budget         Show budget usage"));
-  console.log(chalk.dim("  /audit          Show recent audit log"));
+  console.log(chalk.dim("  /budget         Budget dashboard  (show|history [scope] [id])"));
+  console.log(chalk.dim("  /audit          Audit log  (search <q>|stats|<n>)"));
+  console.log(chalk.dim("  /approvals      HITL approval queue  (list|approve|deny|history)"));
+  console.log(chalk.dim("  /policy         Governance policy  (show|preset|dryrun|test|history|rollback)"));
+  console.log(chalk.dim("  /identity       Identity management  (whoami|list|create|role)"));
   console.log(chalk.dim("  /memory         Show memory store stats"));
-  console.log(chalk.dim("  /sandbox        Show sandbox mode & Docker status"));
+  console.log(chalk.dim("  /sandbox        Sandbox management  (status|acquire|exec|health|extract|release|cleanup)"));
   console.log(chalk.dim("  /config         Show runtime configuration"));
   console.log(chalk.dim("  /doctor         Run configuration and environment checks"));
   console.log(chalk.dim("  /setup          Create runtime directories and starter .env"));
@@ -481,6 +499,306 @@ async function cmdSkills(parts: string[], ctx: SlashCommandContext): Promise<voi
   console.log(chalk.dim("  Usage: /skills [list|pending|approve|retire|show|export|import|install|search|browse|scan|export-md]\n"));
 }
 
+// ── /approvals ───────────────────────────────────────────
+
+async function cmdApprovals(parts: string[], ctx: SlashCommandContext): Promise<void> {
+  const sub = parts[1]?.toLowerCase();
+  const queue = ctx.approvalQueue;
+
+  if (!queue) {
+    console.log(chalk.dim("\n  Approval queue not initialized.\n"));
+    return;
+  }
+
+  const RISK_COLOR: Record<string, (s: string) => string> = {
+    low: chalk.green,
+    medium: chalk.yellow,
+    high: chalk.red,
+    critical: chalk.bgRed.white,
+  };
+  const STATUS_COLOR: Record<string, (s: string) => string> = {
+    pending: chalk.yellow,
+    approved: chalk.green,
+    denied: chalk.red,
+    expired: chalk.dim,
+    cancelled: chalk.dim,
+  };
+
+  if (!sub || sub === "list") {
+    const pending = queue.getPending();
+    if (pending.length === 0) {
+      console.log(chalk.dim("\n  No pending approvals.\n"));
+    } else {
+      console.log(chalk.cyan(`\n  ${pending.length} Pending Approval(s):\n`));
+      for (const r of pending) {
+        const riskColor = RISK_COLOR[r.riskLevel] ?? chalk.white;
+        const age = Math.round((Date.now() - r.requestedAt) / 1000);
+        const expires = r.expiresAt ? Math.max(0, Math.round((r.expiresAt - Date.now()) / 1000)) : null;
+        console.log(`  ${riskColor(`[${r.riskLevel.toUpperCase()}]`)} ${chalk.white(r.toolName)} ${chalk.dim(`[${r.id.slice(0, 8)}]`)}`);
+        console.log(`     Reason: ${chalk.dim(r.reason)}`);
+        console.log(`     Age: ${chalk.dim(`${age}s`)}${expires !== null ? `  Expires in: ${chalk.yellow(`${expires}s`)}` : ""}`);
+        console.log(chalk.dim(`     /approvals approve ${r.id.slice(0, 8)}   or   /approvals deny ${r.id.slice(0, 8)}`));
+        console.log("");
+      }
+    }
+
+    const stats = queue.getStats();
+    console.log(chalk.dim(`  Stats: ${stats.pending} pending · ${stats.approved} approved · ${stats.denied} denied · ${stats.expired} expired\n`));
+    return;
+  }
+
+  if (sub === "approve" || sub === "deny") {
+    const idPrefix = parts[2];
+    const notes = parts.slice(3).join(" ") || undefined;
+    if (!idPrefix) {
+      console.log(chalk.red(`  Usage: /approvals ${sub} <id-prefix> [notes]\n`));
+      return;
+    }
+    // Find by prefix
+    const all = queue.getRecent(100);
+    const match = all.find((r) => r.id.startsWith(idPrefix) && r.status === "pending");
+    if (!match) {
+      console.log(chalk.red(`  No pending approval found matching "${idPrefix}"\n`));
+      return;
+    }
+    const ok = sub === "approve"
+      ? queue.approve(match.id, "cli-operator", notes)
+      : queue.deny(match.id, "cli-operator", notes);
+    if (ok) {
+      const verb = sub === "approve" ? chalk.green("approved") : chalk.red("denied");
+      console.log(chalk.green(`  ✓ Request ${match.id.slice(0, 8)} ${verb}: ${match.toolName}\n`));
+    } else {
+      console.log(chalk.red(`  Failed — request may have already been decided.\n`));
+    }
+    return;
+  }
+
+  if (sub === "history") {
+    const recent = queue.getRecent(20);
+    if (recent.length === 0) {
+      console.log(chalk.dim("\n  No approval history.\n"));
+      return;
+    }
+    console.log(chalk.cyan(`\n  Last ${recent.length} Approval(s):\n`));
+    for (const r of recent) {
+      const statusColor = STATUS_COLOR[r.status] ?? chalk.white;
+      const ts = new Date(r.requestedAt).toLocaleString();
+      console.log(`  ${statusColor(`[${r.status}]`)} ${chalk.white(r.toolName)} ${chalk.dim(ts)}`);
+      if (r.reason) console.log(`     ${chalk.dim(r.reason)}`);
+    }
+    console.log("");
+    return;
+  }
+
+  console.log(chalk.dim("\n  Usage: /approvals [list|approve <id>|deny <id>|history]\n"));
+}
+
+// ── /policy ──────────────────────────────────────────────
+
+async function cmdPolicy(parts: string[], ctx: SlashCommandContext): Promise<void> {
+  const sub = parts[1]?.toLowerCase();
+  const pe = ctx.policyEngine;
+
+  if (!pe) {
+    console.log(chalk.dim("\n  Policy engine not initialized. Create nexus-policy.json to enable.\n"));
+    console.log(chalk.dim("  Presets: local-dev · repo-only · ci · production\n"));
+    return;
+  }
+
+  const ps = (pe as any).getStore?.() ?? pe;
+
+  const PRESET_DESC: Record<string, string> = {
+    "local-dev":   "Permissive — ideal for solo dev, warns on destructive commands",
+    "repo-only":   "Filesystem restricted to git repo, network limited to GitHub",
+    "ci":          "Read-heavy, no HITL, $5 session cap, no deploys",
+    "production":  "All deploys HITL, secrets scanned everywhere, tight audit",
+  };
+
+  if (!sub || sub === "show") {
+    const policy = (ps as any).getCurrent?.();
+    if (!policy) {
+      console.log(chalk.dim("\n  No policy file found. Use /policy preset <name> to create one.\n"));
+      return;
+    }
+    console.log(chalk.cyan("\n  Current Policy:\n"));
+    console.log(`  ${chalk.dim("Version:")}   ${policy.version ?? "1.0"}`);
+    console.log(`  ${chalk.dim("Preset:")}    ${policy.preset ?? chalk.dim("none")}`);
+    console.log(`  ${chalk.dim("Dry-run:")}   ${policy.dryRun ? chalk.yellow("YES — no actions are blocked") : chalk.green("OFF")}`);
+    if (policy.updatedAt) console.log(`  ${chalk.dim("Updated:")}   ${new Date(policy.updatedAt).toLocaleString()}`);
+
+    if (policy.commands) {
+      console.log(`\n  ${chalk.dim("Commands:")}`);
+      if (policy.commands.deny?.length) console.log(`    deny: ${chalk.red(policy.commands.deny.slice(0, 3).join(" · "))}${policy.commands.deny.length > 3 ? " …" : ""}`);
+      if (policy.commands.require_approval?.length) console.log(`    approval: ${chalk.yellow(policy.commands.require_approval.slice(0, 3).join(" · "))}${policy.commands.require_approval.length > 3 ? " …" : ""}`);
+    }
+    if (policy.paths) {
+      console.log(`\n  ${chalk.dim("Paths:")}`);
+      if (policy.paths.allow?.length) console.log(`    allow: ${chalk.green(policy.paths.allow.join(" · "))}`);
+      if (policy.paths.deny?.length) console.log(`    deny: ${chalk.red(policy.paths.deny.slice(0, 3).join(" · "))}`);
+    }
+    if (policy.network) {
+      console.log(`\n  ${chalk.dim("Network:")}`);
+      if (policy.network.allow_domains?.length) console.log(`    allow: ${chalk.green(policy.network.allow_domains.slice(0, 4).join(" · "))}${policy.network.allow_domains.length > 4 ? " …" : ""}`);
+      if (policy.network.deny_domains?.length) console.log(`    deny: ${chalk.red(policy.network.deny_domains.slice(0, 4).join(" · "))}`);
+      console.log(`    http: ${policy.network.allow_http ? chalk.yellow("allowed") : chalk.green("HTTPS only")}`);
+    }
+    console.log("");
+    return;
+  }
+
+  if (sub === "preset") {
+    const preset = parts[2] as string;
+    if (!preset || !PRESET_DESC[preset]) {
+      console.log(chalk.cyan("\n  Available Presets:\n"));
+      for (const [name, desc] of Object.entries(PRESET_DESC)) {
+        console.log(`  ${chalk.white(name.padEnd(12))} ${chalk.dim(desc)}`);
+      }
+      console.log(chalk.dim("\n  Use: /policy preset <name>\n"));
+      return;
+    }
+    const current = (ps as any).getCurrent?.() ?? { version: "1.0" };
+    (ps as any).save?.({ ...current, version: current.version ?? "1.0", preset: preset as any, updatedAt: new Date().toISOString() });
+    console.log(chalk.green(`  ✓ Policy preset set to "${preset}". Changes take effect on next agent run.\n`));
+    return;
+  }
+
+  if (sub === "dryrun") {
+    const toggle = parts[2]?.toLowerCase();
+    const current = (ps as any).getCurrent?.() ?? { version: "1.0" };
+    const newValue = toggle === "on" ? true : toggle === "off" ? false : !current.dryRun;
+    (ps as any).save?.({ ...current, version: current.version ?? "1.0", dryRun: newValue, updatedAt: new Date().toISOString() });
+    console.log(newValue
+      ? chalk.yellow("  ⚠ Policy dry-run enabled — rules will evaluate but NOT block actions.\n")
+      : chalk.green("  ✓ Policy dry-run disabled — rules are enforced.\n"));
+    return;
+  }
+
+  if (sub === "test") {
+    if (parts.length < 4) {
+      console.log(chalk.red("  Usage: /policy test <type> <value>\n  Types: command file network model deploy tool\n"));
+      return;
+    }
+    const type = parts[2] as any;
+    const testValue = parts.slice(3).join(" ");
+    const decision = (pe as any).dryRun?.({ type, value: testValue });
+    if (!decision) { console.log(chalk.dim("  Policy engine does not support dry-run evaluation.\n")); return; }
+    const icon = decision.allowed ? chalk.green("✓") : chalk.red("✗");
+    const level = decision.level === "allow" ? chalk.green(decision.level)
+      : decision.level === "deny" ? chalk.red(decision.level)
+      : chalk.yellow(decision.level);
+    console.log(chalk.cyan("\n  Policy dry-run result:\n"));
+    console.log(`  ${icon} ${level} — ${chalk.dim(decision.reason)}`);
+    if (decision.matchedRule) console.log(`     matched rule: ${chalk.dim(decision.matchedRule)}`);
+    console.log("");
+    return;
+  }
+
+  if (sub === "history") {
+    const history: any[] = (ps as any).getHistory?.() ?? [];
+    if (history.length === 0) {
+      console.log(chalk.dim("\n  No policy history.\n"));
+      return;
+    }
+    console.log(chalk.cyan(`\n  ${history.length} Policy Version(s):\n`));
+    history.slice(-10).reverse().forEach((h: any, i: number) => {
+      const ts = new Date(h.savedAt).toLocaleString();
+      console.log(`  ${chalk.white(`[${i === 0 ? "current" : `v${history.length - i}`}]`)} ${chalk.dim(ts)} — preset: ${h.policy?.preset ?? "custom"}`);
+    });
+    console.log(chalk.dim("\n  Use: /policy rollback <n> to restore version n\n"));
+    return;
+  }
+
+  if (sub === "rollback") {
+    const v = parseInt(parts[2] ?? "", 10);
+    if (isNaN(v)) { console.log(chalk.red("  Usage: /policy rollback <version-number>\n")); return; }
+    try {
+      (ps as any).rollback?.(v);
+      console.log(chalk.green(`  ✓ Policy rolled back to version ${v}.\n`));
+    } catch {
+      console.log(chalk.red(`  Version ${v} not found in history.\n`));
+    }
+    return;
+  }
+
+  console.log(chalk.dim("\n  Usage: /policy [show|preset <name>|dryrun [on|off]|test <type> <value>|history|rollback <n>]\n"));
+}
+
+// ── /identity ────────────────────────────────────────────
+
+function cmdIdentity(parts: string[], ctx: SlashCommandContext): void {
+  const sub = parts[1]?.toLowerCase();
+  const im = ctx.identityManager;
+
+  if (!im) {
+    console.log(chalk.dim("\n  Identity manager not initialized.\n"));
+    return;
+  }
+
+  const ROLE_COLOR: Record<string, (s: string) => string> = {
+    owner:     chalk.magenta,
+    admin:     chalk.red,
+    developer: chalk.green,
+    viewer:    chalk.dim,
+    ci:        chalk.cyan,
+  };
+
+  if (!sub || sub === "whoami") {
+    const me = im.resolve();
+    const roleColor = ROLE_COLOR[me.role] ?? chalk.white;
+    console.log(chalk.cyan("\n  Current Identity:\n"));
+    console.log(`  ${chalk.white(me.name)} ${chalk.dim(`[${me.id}]`)}`);
+    console.log(`  Role: ${roleColor(me.role)}`);
+    if (me.email) console.log(`  Email: ${chalk.dim(me.email)}`);
+    if (me.budgetLimitUsd) console.log(`  Budget override: ${chalk.dim(`$${me.budgetLimitUsd}`)}`);
+    console.log(`  Can execute tools: ${im.canExecuteTools(me) ? chalk.green("yes") : chalk.red("no (viewer)")}`);
+    console.log(`  Can approve: ${im.canApprove(me) ? chalk.green("yes") : chalk.dim("no")}`);
+    console.log("");
+    return;
+  }
+
+  if (sub === "list") {
+    const identities = im.list();
+    if (identities.length === 0) {
+      console.log(chalk.dim("\n  No identities. Run /identity create to add one.\n"));
+      return;
+    }
+    console.log(chalk.cyan(`\n  ${identities.length} Identity(ies):\n`));
+    for (const id of identities) {
+      const roleColor = ROLE_COLOR[id.role] ?? chalk.white;
+      const last = id.lastActiveAt ? new Date(id.lastActiveAt).toLocaleDateString() : "never";
+      console.log(`  ${roleColor(`[${id.role}]`)} ${chalk.white(id.name)} ${chalk.dim(`— last active: ${last}`)}`);
+      if (id.email) console.log(`     ${chalk.dim(id.email)}`);
+    }
+    console.log("");
+    return;
+  }
+
+  if (sub === "create") {
+    const name = parts[2];
+    const role = (parts[3] ?? "developer") as any;
+    if (!name) { console.log(chalk.red("  Usage: /identity create <name> [role]\n")); return; }
+    const identity = im.create({ name, role });
+    console.log(chalk.green(`  ✓ Created identity "${identity.name}" [${identity.role}] — id: ${identity.id}\n`));
+    return;
+  }
+
+  if (sub === "role") {
+    const id = parts[2];
+    const role = parts[3] as any;
+    if (!id || !role) { console.log(chalk.red("  Usage: /identity role <id> <role>\n")); return; }
+    const updated = im.update(id, { role });
+    if (updated) {
+      console.log(chalk.green(`  ✓ Role updated: ${updated.name} → ${role}\n`));
+    } else {
+      console.log(chalk.red(`  Identity "${id}" not found.\n`));
+    }
+    return;
+  }
+
+  console.log(chalk.dim("\n  Usage: /identity [whoami|list|create <name> [role]|role <id> <role>]\n"));
+  console.log(chalk.dim("  Roles: owner · admin · developer · viewer · ci\n"));
+}
+
 // ── /stats ───────────────────────────────────────────────
 
 function cmdStats(ctx: SlashCommandContext): void {
@@ -513,36 +831,147 @@ function cmdStats(ctx: SlashCommandContext): void {
 
 // ── /budget ──────────────────────────────────────────────
 
-function cmdBudget(): void {
+function cmdBudget(parts: string[], ctx: SlashCommandContext): void {
+  const sub = parts[1]?.toLowerCase();
+
+  // Enhanced dashboard when BudgetStore is available
+  if (ctx.budgetStore && (!sub || sub === "show")) {
+    const budgets = ctx.budgetStore.list();
+    const reservations = ctx.budgetStore.getReservations?.() ?? [];
+    console.log(chalk.cyan("\n  Budget Dashboard:\n"));
+    if (budgets.length === 0) {
+      console.log(chalk.dim("  No budget scopes configured.\n"));
+    } else {
+      for (const b of budgets) {
+        const pct = b.limitUsd < Infinity ? b.spentUsd / b.limitUsd : 0;
+        const pctStr = b.limitUsd < Infinity ? `${(pct * 100).toFixed(1)}%` : "—";
+        const remaining = b.limitUsd < Infinity ? `$${(b.limitUsd - b.spentUsd).toFixed(4)} left` : "unlimited";
+        const filled = b.limitUsd < Infinity ? Math.round(pct * 16) : 0;
+        const bar = "█".repeat(Math.min(filled, 16)) + "░".repeat(Math.max(0, 16 - filled));
+        const barColor = pct > 0.9 ? chalk.red : pct > 0.7 ? chalk.yellow : chalk.green;
+        console.log(`  ${chalk.white(`${b.scope}:${b.scopeId}`.padEnd(24))} ${barColor(bar)} ${pctStr.padStart(6)}`);
+        console.log(`     $${b.spentUsd.toFixed(4)} / $${b.limitUsd === Infinity ? "∞" : b.limitUsd.toFixed(2)} — ${remaining} — ${b.period}`);
+      }
+    }
+    if (reservations.length > 0) {
+      const totalReserved = reservations.reduce((s, r) => s + r.amountUsd, 0);
+      console.log(chalk.dim(`\n  Active reservations: ${reservations.length} ($${totalReserved.toFixed(4)} held)\n`));
+    } else {
+      console.log("");
+    }
+    return;
+  }
+
+  // History subcommand
+  if (sub === "history" && ctx.budgetHistory) {
+    const scope = (parts[2] ?? "session") as any;
+    const scopeId = parts[3] ?? "current";
+    const history = ctx.budgetHistory.getHistory(scope, scopeId, Date.now() - 86400_000);
+    if (history.length === 0) {
+      console.log(chalk.dim(`\n  No budget history for ${scope}:${scopeId} in the last 24h.\n`));
+      return;
+    }
+    console.log(chalk.cyan(`\n  Budget History — ${scope}:${scopeId} (last 24h):\n`));
+    let total = 0;
+    for (const e of history.slice(-20)) {
+      total += e.amountUsd;
+      const ts = new Date(e.timestamp).toLocaleTimeString();
+      const model = e.model ? chalk.dim(` [${e.model}]`) : "";
+      console.log(`  ${chalk.dim(ts)} ${chalk.white(`$${e.amountUsd.toFixed(4)}`)}${model} ${chalk.dim(e.action)}`);
+    }
+    console.log(chalk.dim(`\n  Total (shown): $${total.toFixed(4)}\n`));
+    return;
+  }
+
+  // Fallback: simple session view
   const spent = parseFloat(process.env["NEXUS_SPENT_USD"] ?? "0");
   const pct = ((spent / BUDGET_USD) * 100).toFixed(1);
   const filled = Math.round((spent / BUDGET_USD) * 20);
   const bar = "█".repeat(Math.min(filled, 20)) + "░".repeat(Math.max(0, 20 - filled));
-  console.log(chalk.cyan("\n  Budget:\n"));
+  console.log(chalk.cyan("\n  Session Budget:\n"));
   console.log(`  ${chalk.white(`$${spent.toFixed(4)}`)} / ${chalk.white(`$${BUDGET_USD.toFixed(2)}`)}  ${pct}%`);
   console.log(`  ${chalk.green(bar)}\n`);
+  if (ctx.budgetStore || ctx.budgetHistory) {
+    console.log(chalk.dim("  Use /budget show for full dashboard, /budget history for spending history.\n"));
+  }
 }
 
 // ── /audit ───────────────────────────────────────────────
 
-function cmdAudit(ctx: SlashCommandContext): void {
-  const entries = ctx.auditLogger.getRecent(20);
-  if (entries.length === 0) {
-    console.log(chalk.dim("\n  No audit entries yet.\n"));
-    return;
-  }
+function cmdAudit(parts: string[], ctx: SlashCommandContext): void {
+  const sub = parts[1]?.toLowerCase();
+
   const severityColor: Record<string, (s: string) => string> = {
     info: chalk.dim,
     warning: chalk.yellow,
     critical: chalk.red,
     blocked: chalk.bgRed.white,
   };
-  console.log(chalk.cyan(`\n  Last ${Math.min(entries.length, 10)} Audit Entries:\n`));
-  for (const e of entries.slice(-10)) {
+
+  // /audit search <query>
+  if (sub === "search") {
+    const query = parts.slice(2).join(" ");
+    if (!query) { console.log(chalk.red("  Usage: /audit search <query>\n")); return; }
+    // Try DB search first
+    const results = (ctx.auditLogger as any).search?.({ query, limit: 20 }) as any[] ?? ctx.auditLogger.getRecent(100).filter((e) => JSON.stringify(e).toLowerCase().includes(query.toLowerCase()));
+    if (results.length === 0) {
+      console.log(chalk.dim(`\n  No audit entries matching "${query}".\n`));
+      return;
+    }
+    console.log(chalk.cyan(`\n  ${results.length} result(s) for "${query}":\n`));
+    for (const e of results.slice(0, 20)) {
+      const colorFn = severityColor[e.severity] ?? chalk.white;
+      const ts = e.timestamp.slice(0, 19).replace("T", " ");
+      console.log(`  ${chalk.dim(ts)} ${colorFn(`[${e.severity}]`)} ${chalk.white(e.action)}`);
+      if (e.details?.resultPreview) console.log(`     ${chalk.dim(String(e.details.resultPreview).slice(0, 80))}`);
+    }
+    console.log("");
+    return;
+  }
+
+  // /audit stats
+  if (sub === "stats") {
+    const stats = (ctx.auditLogger as any).getStats?.();
+    if (!stats) {
+      console.log(chalk.dim("\n  Audit stats require SQLite persistence (AuditDB).\n"));
+      return;
+    }
+    console.log(chalk.cyan("\n  Audit Stats:\n"));
+    console.log(chalk.dim(`  Total entries: ${stats.total}`));
+    if (stats.byCategory) {
+      console.log(chalk.dim("  By category:"));
+      for (const [cat, n] of Object.entries(stats.byCategory)) {
+        console.log(chalk.dim(`    ${cat.padEnd(12)} ${n}`));
+      }
+    }
+    if (stats.bySeverity) {
+      console.log(chalk.dim("  By severity:"));
+      for (const [sev, n] of Object.entries(stats.bySeverity)) {
+        const color = severityColor[sev] ?? chalk.dim;
+        console.log(`    ${color(sev.padEnd(10))} ${chalk.dim(String(n))}`);
+      }
+    }
+    if (stats.oldestEntry) console.log(chalk.dim(`  Oldest: ${stats.oldestEntry}`));
+    if (stats.newestEntry) console.log(chalk.dim(`  Newest: ${stats.newestEntry}`));
+    console.log("");
+    return;
+  }
+
+  // Default: show recent
+  const count = sub && !isNaN(parseInt(sub)) ? parseInt(sub) : 20;
+  const entries = ctx.auditLogger.getRecent(count);
+  if (entries.length === 0) {
+    console.log(chalk.dim("\n  No audit entries yet.\n"));
+    return;
+  }
+  console.log(chalk.cyan(`\n  Last ${Math.min(entries.length, count)} Audit Entries:\n`));
+  for (const e of entries.slice(-count)) {
     const colorFn = severityColor[e.severity] ?? chalk.white;
     const ts = e.timestamp.slice(11, 19);
     console.log(`  ${chalk.dim(ts)} ${colorFn(`[${e.severity}]`)} ${chalk.white(e.action)}`);
+    if (e.details?.resultPreview) console.log(`     ${chalk.dim(String(e.details.resultPreview).slice(0, 80))}`);
   }
+  console.log(chalk.dim("\n  Subcommands: /audit search <query> | /audit stats | /audit <n>\n"));
   console.log("");
 }
 
@@ -571,23 +1000,174 @@ function cmdMemory(): void {
 
 // ── /sandbox ─────────────────────────────────────────────
 
-function cmdSandbox(): void {
-  const dockerAvailable = (() => {
+async function cmdSandbox(parts: string[], ctx: SlashCommandContext): Promise<void> {
+  const sub = parts[1]?.toLowerCase();
+
+  const STATE_COLOR: Record<string, (s: string) => string> = {
+    running:  chalk.green,
+    creating: chalk.cyan,
+    paused:   chalk.yellow,
+    stopped:  chalk.dim,
+    error:    chalk.red,
+    destroyed: chalk.dim,
+  };
+  const HEALTH_COLOR: Record<string, (s: string) => string> = {
+    healthy:   chalk.green,
+    degraded:  chalk.yellow,
+    unhealthy: chalk.red,
+    unknown:   chalk.dim,
+  };
+
+  const manager = ctx.sandboxManager;
+
+  // ── /sandbox status ───────────────────────────────────
+  if (!sub || sub === "status" || sub === "list") {
+    const dockerAvailable = (() => {
+      try {
+        const { execSync } = require("node:child_process");
+        execSync("docker info", { stdio: "ignore", timeout: 2000 });
+        return true;
+      } catch { return false; }
+    })();
+
+    const e2bAvailable = Boolean(process.env["E2B_API_KEY"]);
+    const sshAvailable = Boolean(process.env["NEXUS_SSH_HOST"]);
+
+    console.log(chalk.cyan("\n  Sandbox System:\n"));
+    console.log(`  ${chalk.dim("Backends:")} `);
+    console.log(`    ${dockerAvailable ? chalk.green("●") : chalk.dim("○")} Docker  ${dockerAvailable ? chalk.green("available") : chalk.dim("not running")}`);
+    console.log(`    ${sshAvailable ? chalk.green("●") : chalk.dim("○")} SSH     ${sshAvailable ? chalk.green(process.env["NEXUS_SSH_HOST"]!) : chalk.dim("NEXUS_SSH_HOST not set")}`);
+    console.log(`    ${e2bAvailable ? chalk.green("●") : chalk.dim("○")} E2B     ${e2bAvailable ? chalk.green("API key set") : chalk.dim("E2B_API_KEY not set")}`);
+    console.log(`    ${chalk.green("●")} Local   ${chalk.green("always available")}`);
+
+    if (manager) {
+      const sandboxes = manager.list();
+      console.log(`\n  ${chalk.dim("Active sandboxes:")} ${sandboxes.length}`);
+      for (const s of sandboxes) {
+        const stColor = STATE_COLOR[s.state] ?? chalk.white;
+        const age = Math.round((Date.now() - s.createdAt) / 1000);
+        const ttl = s.expiresAt ? `TTL: ${Math.max(0, Math.round((s.expiresAt - Date.now()) / 1000))}s` : "no TTL";
+        console.log(`    ${stColor(`[${s.state}]`)} ${chalk.white(s.taskId)} ${chalk.dim(`${s.backendType} · age: ${age}s · ${ttl}`)}`);
+        console.log(`       workdir: ${chalk.dim(s.workdir)}  id: ${chalk.dim(s.backendId.slice(0, 16))}...`);
+      }
+    } else {
+      console.log(chalk.dim("\n  SandboxManager not initialized (set NEXUS_SANDBOX=docker or configure a backend).\n"));
+    }
+    console.log(chalk.dim("\n  Subcommands: status · acquire · exec · health · logs · extract · release · cleanup\n"));
+    return;
+  }
+
+  // ── /sandbox acquire <taskId> [backend] ───────────────
+  if (sub === "acquire") {
+    const taskId = parts[2];
+    const backend = (parts[3] as any) || undefined;
+    if (!taskId) { console.log(chalk.red("  Usage: /sandbox acquire <taskId> [backend]\n")); return; }
+    if (!manager) { console.log(chalk.dim("  SandboxManager not initialized.\n")); return; }
+
+    console.log(chalk.dim(`\n  Acquiring sandbox for task "${taskId}"...`));
     try {
-      const { execSync } = require("node:child_process");
-      execSync("docker info", { stdio: "ignore", timeout: 2000 });
-      return true;
-    } catch { return false; }
-  })();
-  const mode = process.env.NEXUS_SANDBOX === "docker" ? "docker" : "local";
-  console.log(chalk.cyan("\n  Sandbox:\n"));
-  console.log(chalk.dim(`  Mode:   ${chalk.white(mode)}`));
-  console.log(
-    chalk.dim(
-      `  Docker: ${dockerAvailable ? chalk.green("available") : chalk.yellow("not available (using local fallback)")}`,
-    ),
-  );
-  console.log("");
+      const handle = await manager.acquire(taskId, backend ? { backendType: backend } : undefined);
+      const stColor = STATE_COLOR[handle.state] ?? chalk.white;
+      console.log(chalk.green(`  ✓ Sandbox ready:`));
+      console.log(`    ${chalk.dim("ID:")}      ${handle.id}`);
+      console.log(`    ${chalk.dim("Backend:")} ${stColor(handle.backendType)}`);
+      console.log(`    ${chalk.dim("State:")}   ${stColor(handle.state)}`);
+      console.log(`    ${chalk.dim("Workdir:")} ${handle.workdir}`);
+      if (handle.localWorkdir) console.log(`    ${chalk.dim("Local:")}   ${handle.localWorkdir}`);
+      console.log("");
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ Failed to acquire sandbox: ${err.message}\n`));
+    }
+    return;
+  }
+
+  // ── /sandbox exec <taskId> <command> ──────────────────
+  if (sub === "exec") {
+    const taskId = parts[2];
+    const command = parts.slice(3).join(" ");
+    if (!taskId || !command) { console.log(chalk.red("  Usage: /sandbox exec <taskId> <command>\n")); return; }
+    if (!manager) { console.log(chalk.dim("  SandboxManager not initialized.\n")); return; }
+
+    try {
+      const result = await manager.exec(taskId, command);
+      if (result.stdout) console.log(chalk.dim("\n  stdout:\n") + result.stdout);
+      if (result.stderr) console.log(chalk.yellow("\n  stderr:\n") + result.stderr);
+      const exitColor = result.exitCode === 0 ? chalk.green : chalk.red;
+      console.log(exitColor(`\n  Exit: ${result.exitCode}`) + chalk.dim(` (${result.durationMs}ms)\n`));
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ ${err.message}\n`));
+    }
+    return;
+  }
+
+  // ── /sandbox health <taskId> ──────────────────────────
+  if (sub === "health") {
+    const taskId = parts[2];
+    if (!taskId) { console.log(chalk.red("  Usage: /sandbox health <taskId>\n")); return; }
+    if (!manager) { console.log(chalk.dim("  SandboxManager not initialized.\n")); return; }
+
+    const result = await manager.healthCheck(taskId);
+    const hColor = HEALTH_COLOR[result.health] ?? chalk.white;
+    console.log(`\n  Health: ${hColor(result.health)} ${chalk.dim(`(${result.latencyMs}ms)`)}`);
+    if (result.message) console.log(`  ${chalk.dim(result.message)}`);
+    console.log("");
+    return;
+  }
+
+  // ── /sandbox extract <taskId> <patterns...> ───────────
+  if (sub === "extract") {
+    const taskId = parts[2];
+    const patterns = parts.slice(3);
+    if (!taskId || patterns.length === 0) {
+      console.log(chalk.red("  Usage: /sandbox extract <taskId> <pattern> [pattern...]\n"));
+      return;
+    }
+    if (!manager) { console.log(chalk.dim("  SandboxManager not initialized.\n")); return; }
+
+    console.log(chalk.dim(`\n  Extracting artifacts from "${taskId}"...`));
+    try {
+      const artifacts = await manager.extractArtifacts(taskId, patterns);
+      if (artifacts.length === 0) {
+        console.log(chalk.dim("  No files matched.\n"));
+      } else {
+        console.log(chalk.green(`  ✓ ${artifacts.length} artifact(s) extracted:\n`));
+        for (const a of artifacts) {
+          const sizeKb = (a.sizeBytes / 1024).toFixed(1);
+          console.log(`    ${chalk.white(a.sandboxPath)} → ${chalk.dim(a.localPath)} (${sizeKb}KB)`);
+        }
+        console.log("");
+      }
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ ${err.message}\n`));
+    }
+    return;
+  }
+
+  // ── /sandbox release <taskId> ─────────────────────────
+  if (sub === "release" || sub === "destroy") {
+    const taskId = parts[2];
+    if (!taskId) { console.log(chalk.red(`  Usage: /sandbox ${sub} <taskId>\n`)); return; }
+    if (!manager) { console.log(chalk.dim("  SandboxManager not initialized.\n")); return; }
+
+    try {
+      await manager.release(taskId);
+      console.log(chalk.green(`  ✓ Sandbox for "${taskId}" released.\n`));
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ ${err.message}\n`));
+    }
+    return;
+  }
+
+  // ── /sandbox cleanup ──────────────────────────────────
+  if (sub === "cleanup") {
+    if (!manager) { console.log(chalk.dim("  SandboxManager not initialized.\n")); return; }
+    const count = manager.list().length;
+    await manager.destroyAll();
+    console.log(chalk.green(`  ✓ Destroyed ${count} sandbox(es).\n`));
+    return;
+  }
+
+  console.log(chalk.dim("\n  Usage: /sandbox [status|acquire|exec|health|extract|release|cleanup]\n"));
 }
 
 // ── /config ──────────────────────────────────────────────
@@ -893,11 +1473,25 @@ export async function handleSlashCommand(input: string, ctx: SlashCommandContext
       return true;
 
     case "/budget":
-      cmdBudget();
+      cmdBudget(parts, ctx);
       return true;
 
     case "/audit":
-      cmdAudit(ctx);
+      cmdAudit(parts, ctx);
+      return true;
+
+    case "/approvals":
+    case "/approval":
+      await cmdApprovals(parts, ctx);
+      return true;
+
+    case "/policy":
+      await cmdPolicy(parts, ctx);
+      return true;
+
+    case "/identity":
+    case "/whoami":
+      cmdIdentity(parts, ctx);
       return true;
 
     case "/memory":
@@ -905,7 +1499,7 @@ export async function handleSlashCommand(input: string, ctx: SlashCommandContext
       return true;
 
     case "/sandbox":
-      cmdSandbox();
+      await cmdSandbox(parts, ctx);
       return true;
 
     case "/config":
