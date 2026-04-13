@@ -5,7 +5,7 @@ Your first conversation with Nexus — from install to chatting in 2 minutes.
 ## 1. Install Nexus
 
 ```bash
-git clone https://github.com/your-org/nexus.git
+git clone https://github.com/prathyushnallamothu/nexus.git
 cd nexus
 bun install
 bun run dev setup

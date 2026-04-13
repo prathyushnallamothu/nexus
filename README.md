@@ -14,7 +14,7 @@ Nexus is an autonomous AI agent that learns from every task. Unlike coding copil
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/your-org/nexus.git
+git clone https://github.com/prathyushnallamothu/nexus.git
 cd nexus
 bun install
 
@@ -230,6 +230,6 @@ MIT License — see [LICENSE](LICENSE) for details.
 ## 🔗 Links
 
 - [Documentation](docs/)
-- [GitHub Issues](https://github.com/your-org/nexus/issues)
+- [GitHub Issues](https://github.com/prathyushnallamothu/nexus/issues)
 - [Discord](https://discord.gg/nexus) (coming soon)
 - [Twitter](https://twitter.com/nexus_ai) (coming soon)

@@ -12,7 +12,7 @@ Install Nexus on your local machine or any infrastructure. Nexus runs on Bun, a 
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-org/nexus.git
+git clone https://github.com/prathyushnallamothu/nexus.git
 cd nexus
 
 # 2. Install dependencies
@@ -35,7 +35,7 @@ If you prefer manual configuration:
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/your-org/nexus.git
+git clone https://github.com/prathyushnallamothu/nexus.git
 cd nexus
 bun install
 
@@ -89,7 +89,7 @@ Nexus runs on Windows via WSL2 or PowerShell. WSL2 is recommended for better com
 
 ```powershell
 # PowerShell
-git clone https://github.com/your-org/nexus.git
+git clone https://github.com/prathyushnallamothu/nexus.git
 cd nexus
 bun install
 bun run dev setup
@@ -102,7 +102,7 @@ bun run dev setup
 brew install oven-sh/bun/bun
 
 # Then proceed with normal installation
-git clone https://github.com/your-org/nexus.git
+git clone https://github.com/prathyushnallamothu/nexus.git
 cd nexus
 bun install
 bun run dev setup
@@ -116,7 +116,7 @@ curl -fsSL https://bun.sh/install | bash
 source ~/.bashrc
 
 # Then proceed with normal installation
-git clone https://github.com/your-org/nexus.git
+git clone https://github.com/prathyushnallamothu/nexus.git
 cd nexus
 bun install
 bun run dev setup
