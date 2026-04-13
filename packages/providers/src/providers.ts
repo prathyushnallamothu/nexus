@@ -603,6 +603,135 @@ class OpenRouterProvider extends OpenAIProvider {
   }
 }
 
+// ── Model Listing ───────────────────────────────────────────
+
+export async function listModels(provider: string, apiKey?: string): Promise<string[]> {
+  const models: string[] = [];
+
+  switch (provider) {
+    case "anthropic": {
+      const key = apiKey ?? process.env.ANTHROPIC_API_KEY;
+      if (!key) return DEFAULT_MODELS.anthropic;
+
+      try {
+        const response = await fetch("https://api.anthropic.com/v1/models", {
+          headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
+        });
+        const data = await response.json();
+        if (data.data) {
+          for (const model of data.data) {
+            models.push(model.id);
+          }
+        }
+      } catch {
+        return DEFAULT_MODELS.anthropic;
+      }
+      break;
+    }
+
+    case "openai": {
+      const key = apiKey ?? process.env.OPENAI_API_KEY;
+      if (!key) return DEFAULT_MODELS.openai;
+
+      try {
+        const response = await fetch("https://api.openai.com/v1/models", {
+          headers: { "Authorization": `Bearer ${key}` },
+        });
+        const data = await response.json();
+        if (data.data) {
+          for (const model of data.data) {
+            models.push(model.id);
+          }
+        }
+      } catch {
+        return DEFAULT_MODELS.openai;
+      }
+      break;
+    }
+
+    case "google": {
+      const key = apiKey ?? process.env.GOOGLE_API_KEY;
+      if (!key) return DEFAULT_MODELS.google;
+      // Google doesn't have a public models endpoint, use defaults
+      return DEFAULT_MODELS.google;
+    }
+
+    case "ollama": {
+      try {
+        const response = await fetch("http://localhost:11434/api/tags");
+        const data = await response.json();
+        if (data.models) {
+          for (const model of data.models) {
+            models.push(model.name);
+          }
+        }
+      } catch {
+        return DEFAULT_MODELS.ollama;
+      }
+      break;
+    }
+
+    case "openrouter": {
+      try {
+        const headers: Record<string, string> = {};
+        const key = apiKey ?? process.env.OPENROUTER_API_KEY;
+        if (key) {
+          headers["Authorization"] = `Bearer ${key}`;
+        }
+
+        const response = await fetch("https://openrouter.ai/api/v1/models", {
+          headers,
+        });
+        const data = await response.json();
+        if (data.data) {
+          for (const model of data.data) {
+            models.push(model.id);
+          }
+        }
+      } catch {
+        return DEFAULT_MODELS.openrouter;
+      }
+      break;
+    }
+
+    default:
+      return [];
+  }
+
+  return models.length > 0 ? models : DEFAULT_MODELS[provider as keyof typeof DEFAULT_MODELS] || [];
+}
+
+const DEFAULT_MODELS: Record<string, string[]> = {
+  anthropic: [
+    "claude-sonnet-4-20250514",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
+    "claude-3-opus-20240229",
+  ],
+  openai: [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo",
+    "gpt-3.5-turbo",
+  ],
+  google: [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.0-pro",
+  ],
+  ollama: [
+    "llama3.3",
+    "qwen2.5",
+    "mistral",
+  ],
+  openrouter: [
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-4o",
+    "google/gemini-2.5-flash",
+  ],
+};
+
 // ── Type definitions for API responses ────────────────────
 
 interface AnthropicResponse {

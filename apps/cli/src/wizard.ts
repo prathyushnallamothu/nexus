@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 
 // @ts-ignore - prompts types not available, will be resolved by @types/prompts
 import prompts from "prompts";
+import { listModels } from "@nexus/providers";
 
 import { NEXUS_HOME } from "./config.js";
 
@@ -200,17 +201,35 @@ export async function runSetupWizard(): Promise<WizardConfig> {
     console.log(chalk.green(`  ✓ ${providerInfo.name} requires no API key (local)`));
   }
 
+  // Fetch available models from provider
+  console.log(chalk.dim("  Fetching available models..."));
+  let availableModels: string[] = providerInfo.models;
+  try {
+    // Always try to fetch models (some providers like OpenRouter allow listing without auth)
+    availableModels = await listModels(config.provider, config.apiKey);
+    console.log(chalk.green(`  ✓ Found ${availableModels.length} models`));
+  } catch (error) {
+    console.log(chalk.yellow(`  ⚠ Could not fetch models: ${error instanceof Error ? error.message : String(error)}`));
+    console.log(chalk.yellow("  Using default models"));
+  }
+
   // Step 3: Model Selection
   console.log(chalk.yellow("\n  Step 3/5: Choose your model\n"));
   const modelChoice = await prompts({
-    type: "select",
+    type: "autocomplete",
     name: "model",
-    message: "Which model do you want to use?",
-    choices: providerInfo.models.map((m) => ({
+    message: "Which model do you want to use? (type to search)",
+    choices: availableModels.map((m: string) => ({
       title: m,
       value: m,
     })),
     initial: 0,
+    suggest: async (input: string, choices: any[]) => {
+      const searchTerm = input.toLowerCase();
+      return choices.filter((choice: any) =>
+        choice.title.toLowerCase().includes(searchTerm)
+      );
+    },
   });
 
   if (!modelChoice.model) {

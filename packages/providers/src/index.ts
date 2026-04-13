@@ -8,5 +8,6 @@ export type {
 export {
   createProvider,
   parseModelString,
+  listModels,
   type ProviderConfig,
 } from "./providers.js";
