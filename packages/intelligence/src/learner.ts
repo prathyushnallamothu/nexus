@@ -1,93 +1,296 @@
 /**
  * Nexus Experience Learner
  *
- * The 3-stage learning loop that makes Nexus get better over time:
- *   Stage 1: STORE   — Save what happened (trajectory)
- *   Stage 2: REFLECT — Analyze what went well/wrong
- *   Stage 3: EVOLVE  — Create or improve skills from learnings
+ * The full learning loop — persists to SQLite, classifies outcomes properly,
+ * manages the skill approval pipeline, and retires underperforming skills.
  *
- * This runs as a background process after each task completes,
- * so there's no user-facing latency.
+ * Pipeline:
+ *   1. STORE    — Save trajectory + classified outcome to SQLite
+ *   2. REFLECT  — LLM-driven analysis (background, no user latency)
+ *   3. EVOLVE   — Create/update skills from reflection
+ *   4. APPROVE  — Run auto-eval, promote to pending_review or trusted
+ *   5. RETIRE   — Check all skills for retirement criteria
  */
 
-import type { Message, BudgetState, LLMProvider } from "@nexus/core";
+import type { LLMProvider } from "@nexus/core";
+import type { LearningDB } from "./db.js";
 import type { SkillStore, Skill } from "./skills.js";
+import type { SkillEvaluator } from "./eval.js";
+import { classifyOutcome, type Trajectory, type Reflection } from "./trajectories.js";
 
-export interface Trajectory {
-  /** Task description (user's original message) */
-  task: string;
-  /** Full message history */
-  messages: Message[];
-  /** Final outcome */
-  outcome: "success" | "partial" | "failure";
-  /** Cost and performance */
-  budget: BudgetState;
-  /** Duration in ms */
-  durationMs: number;
-  /** Which routing path was used */
-  routingPath: "system1" | "system2";
-  /** Skill used (if System 1) */
-  skillUsed?: string;
-  /** Timestamp */
-  timestamp: number;
+// ── Learner Config ─────────────────────────────────────────
+
+export interface LearnerConfig {
+  /**
+   * Minimum tool calls for a trajectory to be eligible for skill creation.
+   * Pure Q&A (0 tool calls) is rarely worth turning into a skill.
+   */
+  minToolCallsForReflection: number;
+  /**
+   * Auto-approve skills that pass eval without waiting for human review.
+   * Set false in high-stakes environments to require human sign-off.
+   */
+  autoApprove: boolean;
+  /**
+   * Skill retirement threshold: if success rate drops below this
+   * over the last N uses, the skill is retired.
+   */
+  retirementSuccessThreshold: number;
+  /** Check retirement after every N uses */
+  retirementCheckInterval: number;
+  /**
+   * Whether to run shadow eval (LLM call) in addition to auto eval.
+   * Costs money but gives better signal.
+   */
+  runShadowEval: boolean;
+  /** Project ID for project-scoped skill creation */
+  projectId?: string;
 }
 
-export interface Reflection {
-  /** What strategies worked well */
-  successFactors: string[];
-  /** What went wrong */
-  failurePoints: string[];
-  /** What could be more efficient */
-  efficiencyOpportunities: string[];
-  /** Should a skill be created/updated? */
-  skillRecommendation: {
-    action: "create" | "update" | "none";
-    skillName?: string;
-    description?: string;
-    procedure?: string;
-    triggers?: string[];
-    reason: string;
-  };
-  /** Facts to remember about this user/project */
-  memorableContext: string[];
+const DEFAULT_CONFIG: LearnerConfig = {
+  minToolCallsForReflection: 1,
+  autoApprove: true,
+  retirementSuccessThreshold: 0.4,
+  retirementCheckInterval: 5,
+  runShadowEval: false,
+};
+
+// ── Learn Result ───────────────────────────────────────────
+
+export interface LearnResult {
+  stored: boolean;
+  trajectoryId: string;
+  outcome: Trajectory["outcome"];
+  outcomeConfidence: number;
+  reflection: Reflection | null;
+  evolvedSkill: Skill | null;
+  skillPromoted: boolean;
+  skillRetired: string | null;
 }
+
+// ── ExperienceLearner ──────────────────────────────────────
 
 export class ExperienceLearner {
   private provider: LLMProvider;
   private skillStore: SkillStore;
-  private trajectories: Trajectory[] = [];
+  private db: LearningDB;
+  private evaluator: SkillEvaluator;
+  private config: LearnerConfig;
 
-  constructor(provider: LLMProvider, skillStore: SkillStore) {
+  constructor(
+    provider: LLMProvider,
+    skillStore: SkillStore,
+    db: LearningDB,
+    evaluator: SkillEvaluator,
+    config?: Partial<LearnerConfig>,
+  ) {
     this.provider = provider;
     this.skillStore = skillStore;
+    this.db = db;
+    this.evaluator = evaluator;
+    this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
   /**
-   * Stage 1: STORE — Save the trajectory
+   * Full learning cycle. Non-blocking — call without await for zero latency.
+   *
+   * Returns a promise that resolves when learning is complete.
+   * Errors are caught and reported in the result; they never propagate.
    */
-  store(trajectory: Trajectory): void {
-    this.trajectories.push(trajectory);
-    // Keep last 100 trajectories in memory
-    if (this.trajectories.length > 100) {
-      this.trajectories = this.trajectories.slice(-100);
+  async learn(trajectory: Trajectory): Promise<LearnResult> {
+    const trajId = `traj_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+
+    // ── Stage 1: STORE ──────────────────────────────────────
+
+    // Classify outcome from evidence (not just the default "success")
+    const classification = classifyOutcome(
+      trajectory.messages[trajectory.messages.length - 1]?.content ?? "",
+      trajectory.messages,
+      trajectory.artifacts ?? [],
+      trajectory.hitIterationLimit ?? false,
+      trajectory.userFeedback,
+    );
+
+    // Override trajectory outcome with classified result
+    const finalOutcome = trajectory.outcome !== "unknown"
+      ? trajectory.outcome  // caller provided explicit outcome (user feedback path)
+      : classification.outcome;
+
+    const stored = this.storeTrajectory(trajId, trajectory, finalOutcome, classification);
+
+    if (!stored) {
+      return {
+        stored: false,
+        trajectoryId: trajId,
+        outcome: finalOutcome,
+        outcomeConfidence: classification.confidence,
+        reflection: null,
+        evolvedSkill: null,
+        skillPromoted: false,
+        skillRetired: null,
+      };
+    }
+
+    // Update skill metrics if this used a skill (System 1)
+    if (trajectory.routingPath === "system1" && trajectory.skillUsed) {
+      this.skillStore.recordUsage(trajectory.skillUsed, {
+        success: finalOutcome === "success",
+        costUsd: trajectory.budget.spentUsd,
+        durationMs: trajectory.durationMs,
+      });
+      this.db.updateSkillMetrics(
+        trajectory.skillUsed,
+        finalOutcome,
+        trajectory.budget.spentUsd,
+        trajectory.durationMs,
+      );
+
+      // Check retirement for this skill
+      const retired = await this.checkRetirement(trajectory.skillUsed);
+      return {
+        stored: true,
+        trajectoryId: trajId,
+        outcome: finalOutcome,
+        outcomeConfidence: classification.confidence,
+        reflection: null,
+        evolvedSkill: null,
+        skillPromoted: false,
+        skillRetired: retired,
+      };
+    }
+
+    // ── Stage 2: REFLECT ────────────────────────────────────
+
+    // Skip reflection if not enough tool usage (probably Q&A)
+    if (trajectory.budget.toolCalls < this.config.minToolCallsForReflection) {
+      return {
+        stored: true,
+        trajectoryId: trajId,
+        outcome: finalOutcome,
+        outcomeConfidence: classification.confidence,
+        reflection: null,
+        evolvedSkill: null,
+        skillPromoted: false,
+        skillRetired: null,
+      };
+    }
+
+    let reflection: Reflection | null = null;
+    let evolvedSkill: Skill | null = null;
+    let skillPromoted = false;
+
+    try {
+      reflection = await this.reflect(trajectory, finalOutcome, trajId);
+
+      // ── Stage 3: EVOLVE ──────────────────────────────────
+      evolvedSkill = await this.evolve(trajectory, reflection, trajId, finalOutcome);
+
+      // ── Stage 4: APPROVE ─────────────────────────────────
+      if (evolvedSkill) {
+        skillPromoted = await this.approveSkill(evolvedSkill, trajId);
+      }
+    } catch {
+      // Learning errors are non-fatal
+    }
+
+    return {
+      stored: true,
+      trajectoryId: trajId,
+      outcome: finalOutcome,
+      outcomeConfidence: classification.confidence,
+      reflection,
+      evolvedSkill,
+      skillPromoted,
+      skillRetired: null,
+    };
+  }
+
+  /**
+   * Apply explicit user feedback to the most recent trajectory.
+   * This overrides the auto-classified outcome.
+   */
+  applyUserFeedback(feedback: "positive" | "negative"): void {
+    const recent = this.db.getRecentTrajectories(1);
+    if (!recent.length) return;
+
+    const traj = recent[0];
+    const newOutcome = feedback === "positive" ? "success" : "failure";
+
+    // Re-save with updated outcome
+    this.db.saveTrajectory({ ...traj, outcome: newOutcome, outcomeReason: `User feedback: ${feedback}` });
+
+    // Update skill metrics if applicable
+    if (traj.skillId) {
+      this.db.updateSkillMetrics(traj.skillId, newOutcome, traj.costUsd, traj.durationMs);
     }
   }
 
   /**
-   * Stage 2: REFLECT — Analyze what happened
-   * Uses the LLM to generate a structured reflection.
+   * Manually approve a skill (human reviewer).
    */
-  async reflect(trajectory: Trajectory): Promise<Reflection> {
-    // Build a compact summary of the trajectory
+  async approveSkillManually(skillId: string, notes?: string): Promise<boolean> {
+    const skill = this.skillStore.setStatus(skillId, "trusted");
+    if (!skill) return false;
+    this.db.setSkillStatus(skillId, "trusted", {
+      reviewer: "human",
+      reviewNotes: notes ?? "Manually approved",
+    });
+    return true;
+  }
+
+  /**
+   * Manually retire a skill.
+   */
+  retireSkill(skillId: string, reason: string): boolean {
+    const skill = this.skillStore.setStatus(skillId, "retired");
+    if (!skill) return false;
+    this.db.setSkillStatus(skillId, "retired", { retireReason: reason });
+    return true;
+  }
+
+  /**
+   * Get learning statistics.
+   */
+  getStats(): {
+    trajectoriesStored: number;
+    outcomeBreakdown: Record<string, number>;
+    skillsByStatus: Record<string, number>;
+    pendingApprovals: number;
+  } {
+    const byOutcome = this.db.countByOutcome();
+    const total = Object.values(byOutcome).reduce((a, b) => a + b, 0);
+
+    const allSkills = this.skillStore.getAll({ scope: undefined });
+    const byStatus: Record<string, number> = {};
+    for (const s of allSkills) {
+      byStatus[s.status] = (byStatus[s.status] ?? 0) + 1;
+    }
+
+    const pending = this.db.getPendingApprovals().length;
+
+    return {
+      trajectoriesStored: total,
+      outcomeBreakdown: byOutcome,
+      skillsByStatus: byStatus,
+      pendingApprovals: pending,
+    };
+  }
+
+  // ── Stage 2: Reflect ──────────────────────────────────────
+
+  private async reflect(
+    trajectory: Trajectory,
+    outcome: string,
+    trajId: string,
+  ): Promise<Reflection> {
     const summary = this.summarizeTrajectory(trajectory);
 
     const response = await this.provider.complete(
       [
         {
           role: "system",
-          content: `You are a performance analyst reviewing an AI agent's task execution.
-Analyze the trajectory and provide a structured reflection.
-Respond ONLY with valid JSON matching this schema:
+          content: `You are a performance analyst reviewing an AI agent task execution.
+Analyze the trajectory and respond with ONLY valid JSON:
 {
   "successFactors": ["string"],
   "failurePoints": ["string"],
@@ -97,46 +300,42 @@ Respond ONLY with valid JSON matching this schema:
     "skillName": "string (if create/update)",
     "description": "string (if create/update)",
     "procedure": "step-by-step markdown (if create/update)",
-    "triggers": ["keyword patterns that should activate this skill"],
+    "triggers": ["keyword patterns to activate this skill"],
     "reason": "why this recommendation"
   },
-  "memorableContext": ["facts worth remembering"]
+  "memorableContext": ["generalizable facts worth remembering"]
 }`,
         },
         {
           role: "user",
-          content: `Analyze this agent execution:
-
-**Task:** ${trajectory.task}
-**Outcome:** ${trajectory.outcome}
-**Routing:** ${trajectory.routingPath}
-**Cost:** $${trajectory.budget.spentUsd.toFixed(4)}
-**Duration:** ${trajectory.durationMs}ms
-**LLM Calls:** ${trajectory.budget.llmCalls}
-**Tool Calls:** ${trajectory.budget.toolCalls}
-
-**Execution Summary:**
-${summary}
-
-Provide your reflection as JSON:`,
+          content: [
+            `Task: ${trajectory.task}`,
+            `Outcome: ${outcome}`,
+            `Routing: ${trajectory.routingPath}`,
+            `Cost: $${trajectory.budget.spentUsd.toFixed(4)}`,
+            `Duration: ${trajectory.durationMs}ms`,
+            `LLM calls: ${trajectory.budget.llmCalls}`,
+            `Tool calls: ${trajectory.budget.toolCalls}`,
+            `Artifacts: ${(trajectory.artifacts ?? []).map((a) => a.type).join(", ") || "none"}`,
+            ``,
+            `Execution summary:`,
+            summary,
+            ``,
+            `Respond with JSON reflection:`,
+          ].join("\n"),
         },
       ],
-      [], // No tools needed for reflection
+      [],
       { temperature: 0.3 },
     );
 
     try {
-      // Extract JSON from response (handle markdown code blocks)
-      const jsonStr = response.content
-        .replace(/```json\n?/g, "")
-        .replace(/```\n?/g, "")
-        .trim();
+      const jsonStr = response.content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
       return JSON.parse(jsonStr) as Reflection;
     } catch {
-      // If parsing fails, return a default reflection
       return {
-        successFactors: trajectory.outcome === "success" ? ["Task completed successfully"] : [],
-        failurePoints: trajectory.outcome === "failure" ? ["Task failed"] : [],
+        successFactors: outcome === "success" ? ["Task completed"] : [],
+        failurePoints: outcome !== "success" ? ["Task did not succeed"] : [],
         efficiencyOpportunities: [],
         skillRecommendation: { action: "none", reason: "Could not parse reflection" },
         memorableContext: [],
@@ -144,16 +343,18 @@ Provide your reflection as JSON:`,
     }
   }
 
-  /**
-   * Stage 3: EVOLVE — Create or update skills based on reflection
-   */
-  async evolve(trajectory: Trajectory, reflection: Reflection): Promise<Skill | null> {
-    const rec = reflection.skillRecommendation;
+  // ── Stage 3: Evolve ───────────────────────────────────────
 
+  private async evolve(
+    trajectory: Trajectory,
+    reflection: Reflection,
+    trajId: string,
+    outcome: string,
+  ): Promise<Skill | null> {
+    const rec = reflection.skillRecommendation;
     if (rec.action === "none") return null;
 
     if (rec.action === "create" && rec.skillName && rec.procedure) {
-      // Create a new skill
       const skill = this.skillStore.add({
         name: rec.skillName,
         description: rec.description ?? "",
@@ -161,27 +362,35 @@ Provide your reflection as JSON:`,
         category: this.inferCategory(trajectory.task),
         tags: rec.triggers ?? [],
         triggers: rec.triggers ?? [],
+        scope: this.config.projectId ? "project" : "global",
+        projectId: this.config.projectId,
+        provenance: {
+          createdBy: "learner",
+          sourceTrajectoryIds: [trajId],
+        },
       });
 
-      // Record the first usage from this trajectory
+      // Register in DB as draft
+      this.db.setSkillStatus(skill.id, "draft", { sourceTrajectoryIds: [trajId] });
+
+      // Record initial usage from this trajectory
       this.skillStore.recordUsage(skill.id, {
-        success: trajectory.outcome === "success",
+        success: outcome === "success",
         costUsd: trajectory.budget.spentUsd,
         durationMs: trajectory.durationMs,
       });
+      this.db.updateSkillMetrics(skill.id, outcome as any, trajectory.budget.spentUsd, trajectory.durationMs);
 
       return skill;
     }
 
     if (rec.action === "update" && rec.skillName) {
-      // Find existing skill and mutate it
-      const skills = this.skillStore.getAll();
-      const existing = skills.find(
+      const existing = this.skillStore.getAll({ scope: undefined }).find(
         (s) => s.name.toLowerCase() === rec.skillName!.toLowerCase(),
       );
 
       if (existing) {
-        const mutated = this.skillStore.mutate(
+        return this.skillStore.mutate(
           existing.id,
           {
             procedure: rec.procedure ?? existing.procedure,
@@ -189,98 +398,153 @@ Provide your reflection as JSON:`,
             triggers: rec.triggers ?? existing.triggers,
           },
           rec.reason,
+          trajId,
         );
-        return mutated;
       }
     }
 
     return null;
   }
 
-  /**
-   * Full learning cycle — run all three stages
-   */
-  async learn(trajectory: Trajectory): Promise<{
-    stored: boolean;
-    reflection: Reflection | null;
-    evolvedSkill: Skill | null;
-  }> {
-    // Stage 1: Store
-    this.store(trajectory);
+  // ── Stage 4: Approve ──────────────────────────────────────
 
-    // Only reflect on System 2 runs (System 1 already used a skill)
-    if (trajectory.routingPath === "system1") {
-      // Just update skill usage stats
-      if (trajectory.skillUsed) {
-        this.skillStore.recordUsage(trajectory.skillUsed, {
-          success: trajectory.outcome === "success",
-          costUsd: trajectory.budget.spentUsd,
-          durationMs: trajectory.durationMs,
-        });
-      }
-      return { stored: true, reflection: null, evolvedSkill: null };
-    }
-
-    // Stage 2: Reflect only on tasks worth turning into a skill:
-    // must have used at least 1 tool (real work was done), not just Q&A
-    if (trajectory.budget.toolCalls < 1) {
-      return { stored: true, reflection: null, evolvedSkill: null };
-    }
-
+  private async approveSkill(skill: Skill, trajId: string): Promise<boolean> {
     try {
-      const reflection = await this.reflect(trajectory);
+      const evalResult = await this.evaluator.evalForPromotion(skill, {
+        passThreshold: 0.65,
+        runShadow: this.config.runShadowEval,
+      });
 
-      // Stage 3: Evolve
-      const evolvedSkill = await this.evolve(trajectory, reflection);
+      if (!evalResult.passed) {
+        // Keep as draft — needs more data
+        this.db.setSkillStatus(skill.id, "draft", {
+          evalScore: evalResult.score,
+          reviewer: "auto",
+          reviewNotes: evalResult.reason,
+        });
+        return false;
+      }
 
-      return { stored: true, reflection, evolvedSkill };
+      if (this.config.autoApprove) {
+        // Auto-promote to trusted
+        this.skillStore.setStatus(skill.id, "trusted");
+        this.db.setSkillStatus(skill.id, "trusted", {
+          evalScore: evalResult.score,
+          reviewer: "auto",
+          reviewNotes: evalResult.reason,
+          sourceTrajectoryIds: [trajId],
+        });
+        return true;
+      } else {
+        // Promote to pending_review for human sign-off
+        this.skillStore.setStatus(skill.id, "pending_review");
+        this.db.setSkillStatus(skill.id, "pending_review", {
+          evalScore: evalResult.score,
+          sourceTrajectoryIds: [trajId],
+        });
+        return false;
+      }
     } catch {
-      return { stored: true, reflection: null, evolvedSkill: null };
+      return false;
     }
   }
 
-  /** Get learning statistics */
-  getStats(): {
-    trajectoriesStored: number;
-    skillsCreated: number;
-    skillsMutated: number;
-  } {
-    const allSkills = this.skillStore.getAll();
-    return {
-      trajectoriesStored: this.trajectories.length,
-      skillsCreated: allSkills.length,
-      skillsMutated: allSkills.reduce((sum, s) => sum + Math.max(0, s.version - 1), 0),
-    };
+  // ── Stage 5: Retire ───────────────────────────────────────
+
+  private async checkRetirement(skillId: string): Promise<string | null> {
+    const metrics = this.db.getSkillMetrics(skillId);
+    if (!metrics) return null;
+
+    // Only check every N uses
+    if (metrics.usageCount % this.config.retirementCheckInterval !== 0) return null;
+
+    // Need at least 10 uses for a meaningful retirement decision
+    if (metrics.usageCount < 10) return null;
+
+    if (metrics.successRate < this.config.retirementSuccessThreshold) {
+      const reason = `Success rate ${(metrics.successRate * 100).toFixed(1)}% dropped below ${(this.config.retirementSuccessThreshold * 100).toFixed(0)}% over ${metrics.usageCount} uses`;
+      this.skillStore.setStatus(skillId, "retired");
+      this.db.setSkillStatus(skillId, "retired", { retireReason: reason });
+      return reason;
+    }
+
+    return null;
   }
 
-  /** Summarize a trajectory for reflection (keep it compact) */
+  // ── Helpers ───────────────────────────────────────────────
+
+  private storeTrajectory(
+    trajId: string,
+    trajectory: Trajectory,
+    outcome: Trajectory["outcome"],
+    classification: ReturnType<typeof classifyOutcome>,
+  ): boolean {
+    try {
+      const artifacts = trajectory.artifacts ?? [];
+      const filesChanged = artifacts
+        .filter((a) => a.type === "file_write" || a.type === "file_patch")
+        .map((a) => a.path)
+        .filter(Boolean) as string[];
+      const commandsRun = artifacts
+        .filter((a) => a.type === "command_run")
+        .map((a) => a.command)
+        .filter(Boolean) as string[];
+
+      this.db.saveTrajectory({
+        id: trajId,
+        sessionId: trajectory.sessionId ?? `sess_${Date.now()}`,
+        task: trajectory.task,
+        routingPath: trajectory.routingPath,
+        skillId: trajectory.skillUsed,
+        outcome,
+        outcomeReason: classification.reason,
+        outcomeConfidence: classification.confidence,
+        tokensIn: trajectory.budget.tokensIn,
+        tokensOut: trajectory.budget.tokensOut,
+        costUsd: trajectory.budget.spentUsd,
+        durationMs: trajectory.durationMs,
+        llmCalls: trajectory.budget.llmCalls,
+        toolCalls: trajectory.budget.toolCalls,
+        filesChanged,
+        commandsRun,
+        exitCodes: [],
+        toolsUsed: [...new Set(trajectory.messages
+          .filter((m) => m.role === "assistant" && m.toolCalls?.length)
+          .flatMap((m) => m.toolCalls!.map((tc) => tc.name)))],
+        artifactsJson: JSON.stringify(artifacts),
+        messagesJson: JSON.stringify(trajectory.messages),
+        projectId: trajectory.projectId ?? this.config.projectId,
+        tags: [],
+        createdAt: trajectory.timestamp ?? Date.now(),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private summarizeTrajectory(trajectory: Trajectory): string {
     const lines: string[] = [];
-    let toolCallIdx = 0;
+    let toolIdx = 0;
 
     for (const msg of trajectory.messages) {
       if (msg.role === "system") continue;
-
       if (msg.role === "user") {
         lines.push(`USER: ${msg.content.slice(0, 200)}`);
       } else if (msg.role === "assistant") {
         if (msg.toolCalls?.length) {
           for (const tc of msg.toolCalls) {
-            toolCallIdx++;
-            const argsStr = JSON.stringify(tc.arguments).slice(0, 100);
-            lines.push(`TOOL_CALL ${toolCallIdx}: ${tc.name}(${argsStr})`);
+            toolIdx++;
+            lines.push(`TOOL[${toolIdx}]: ${tc.name}(${JSON.stringify(tc.arguments).slice(0, 80)})`);
           }
         }
-        if (msg.content) {
-          lines.push(`ASSISTANT: ${msg.content.slice(0, 200)}`);
-        }
+        if (msg.content) lines.push(`ASSISTANT: ${msg.content.slice(0, 150)}`);
       } else if (msg.role === "tool") {
-        const preview = msg.content.slice(0, 100).replace(/\n/g, " ");
-        lines.push(`TOOL_RESULT: ${preview}`);
+        lines.push(`RESULT: ${msg.content.slice(0, 100).replace(/\n/g, " ")}`);
       }
     }
 
-    return lines.join("\n");
+    return lines.slice(-30).join("\n"); // Last 30 lines to stay compact
   }
 
   private inferCategory(task: string): string {
@@ -292,3 +556,6 @@ Provide your reflection as JSON:`,
     return "general";
   }
 }
+
+// Re-export Trajectory type for callers
+export type { Trajectory, Reflection } from "./trajectories.js";

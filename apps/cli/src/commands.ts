@@ -6,12 +6,16 @@ import chalk from "chalk";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import type { Message } from "@nexus/core";
-import type { SkillStore, DualProcessRouter, ExperienceLearner } from "@nexus/intelligence";
+import type { SkillStore, DualProcessRouter, ExperienceLearner, LearningDB } from "@nexus/intelligence";
+import { GitHubSkillInstaller, SkillsDirScanner, SkillsShClient, installFromFile } from "@nexus/intelligence";
+import { writeFileSync } from "node:fs";
 import type { AuditLogger } from "@nexus/governance";
 import type { McpManager, McpConfigStore } from "@nexus/protocols";
 import type { CronStore } from "@nexus/runtime";
+import { WikiStore } from "@nexus/core";
 import { listSessions, loadSessionById, type SessionMeta } from "./session.js";
 import { DEFAULT_MODEL, BUDGET_USD, NEXUS_HOME } from "./config.js";
+import { printDoctorReport, printSetupReport, validateConfig } from "./diagnostics.js";
 
 export interface SlashCommandContext {
   sessionMessages: Message[];
@@ -19,6 +23,7 @@ export interface SlashCommandContext {
   skillStore: SkillStore;
   router: DualProcessRouter;
   learner: ExperienceLearner;
+  learningDb?: LearningDB;
   auditLogger: AuditLogger;
   mcpManager: McpManager | null;
   mcpConfigStore: McpConfigStore | null;
@@ -38,7 +43,14 @@ function cmdHelp(): void {
   console.log(chalk.dim("  /retry          Re-send the last message"));
   console.log(chalk.dim("  /sessions       List saved sessions  (/sessions load <n>)"));
   console.log(chalk.dim("  /model          Show current model"));
-  console.log(chalk.dim("  /skills         List learned skills"));
+  console.log(chalk.dim("  /skills         Manage skills  (list|pending|approve|retire|show|export|import)"));
+  console.log(chalk.dim("  /skills install <org/repo>  Install skill from GitHub (SKILL.md)"));
+  console.log(chalk.dim("  /skills search <query>      Search skills.sh / GitHub registry"));
+  console.log(chalk.dim("  /skills browse [category]   Browse top skills by category"));
+  console.log(chalk.dim("  /skills scan                Scan local .claude/skills/ directories"));
+  console.log(chalk.dim("  /skills export-md [id]      Export skill(s) to SKILL.md format"));
+  console.log(chalk.dim("  /thumbsup       Mark last response as successful (updates learning)"));
+  console.log(chalk.dim("  /thumbsdown     Mark last response as failed (updates learning)"));
   console.log(chalk.dim("  /modes          (set in modes/ directory)"));
   console.log(chalk.dim("  /stats          Show routing & learning stats"));
   console.log(chalk.dim("  /budget         Show budget usage"));
@@ -46,8 +58,11 @@ function cmdHelp(): void {
   console.log(chalk.dim("  /memory         Show memory store stats"));
   console.log(chalk.dim("  /sandbox        Show sandbox mode & Docker status"));
   console.log(chalk.dim("  /config         Show runtime configuration"));
+  console.log(chalk.dim("  /doctor         Run configuration and environment checks"));
+  console.log(chalk.dim("  /setup          Create runtime directories and starter .env"));
   console.log(chalk.dim("  /mcp            List MCP servers  (/mcp list|tools|test|enable|disable|remove)"));
   console.log(chalk.dim("  /cron           List scheduled cron jobs"));
+  console.log(chalk.dim("  /wiki           Wiki knowledge base  (/wiki index|search <q>|list|lint)"));
   console.log(chalk.dim("  /exit           Exit Nexus"));
   console.log("");
 }
@@ -146,21 +161,324 @@ function cmdRetry(ctx: SlashCommandContext): void {
 
 // ── /skills ──────────────────────────────────────────────
 
-function cmdSkills(ctx: SlashCommandContext): void {
-  const skills = ctx.skillStore.getAll();
-  if (skills.length === 0) {
-    console.log(chalk.dim("\n  No skills learned yet. Use Nexus and it will learn!\n"));
-  } else {
-    console.log(chalk.cyan(`\n  ${skills.length} Learned Skills:\n`));
+const STATUS_ICON: Record<string, string> = {
+  draft: "○",
+  pending_review: "◎",
+  trusted: "✓",
+  retired: "✗",
+};
+
+async function cmdSkills(parts: string[], ctx: SlashCommandContext): Promise<void> {
+  const sub = parts[1]?.toLowerCase();
+
+  // /skills list [status]
+  if (!sub || sub === "list") {
+    const filterStatus = parts[2] as string | undefined;
+    const skills = ctx.skillStore.getAll(filterStatus ? { status: filterStatus as any } : undefined);
+    if (skills.length === 0) {
+      console.log(chalk.dim(`\n  No ${filterStatus ?? ""}skills found. Nexus learns as you use it!\n`));
+      return;
+    }
+    const header = filterStatus ? `${filterStatus} skills` : "All Skills";
+    console.log(chalk.cyan(`\n  ${skills.length} ${header}:\n`));
     for (const s of skills) {
-      const rate = (s.successRate * 100).toFixed(0);
+      const icon = STATUS_ICON[s.status] ?? "?";
+      const conf = s.confidence.n > 0
+        ? `${(s.confidence.point * 100).toFixed(0)}% (±${((s.confidence.upper - s.confidence.lower) / 2 * 100).toFixed(0)}%)`
+        : "no data";
+      const color = s.status === "trusted" ? chalk.green : s.status === "retired" ? chalk.red : chalk.yellow;
       console.log(
-        `  ${chalk.white(s.name)} ${chalk.dim(`v${s.version}`)} — ` +
-          `${chalk.green(`${rate}%`)} success, ${chalk.dim(`${s.usageCount} uses, $${s.avgCostUsd.toFixed(4)} avg`)}`,
+        `  ${color(icon)} ${chalk.white(s.name)} ${chalk.dim(`v${s.version} [${s.status}]`)}`,
+      );
+      console.log(
+        `    ${chalk.dim(`confidence: ${conf} · ${s.confidence.n} uses · ${s.scope === "project" ? "project" : "global"}`)}`,
       );
     }
+    console.log(chalk.dim(`\n  Subcommands: list [status] | pending | approve <id> | retire <id> | show <id> | export | import <file>`));
+    console.log(chalk.dim(`               install <org/repo> | search <query> | browse [category] | scan | export-md [id]`));
     console.log("");
+    return;
   }
+
+  // /skills pending — show pending approvals
+  if (sub === "pending") {
+    const pending = ctx.learningDb?.getPendingApprovals() ?? [];
+    if (pending.length === 0) {
+      console.log(chalk.dim("\n  No skills pending review.\n"));
+      return;
+    }
+    console.log(chalk.cyan(`\n  ${pending.length} Skills Pending Review:\n`));
+    for (const p of pending) {
+      const skill = ctx.skillStore.get(p.skillId);
+      console.log(
+        `  ◎ ${chalk.white(skill?.name ?? p.skillId)} — eval score: ${p.evalScore != null ? (p.evalScore * 100).toFixed(0) + "%" : "n/a"}`,
+      );
+      console.log(chalk.dim(`    /skills approve ${p.skillId}   or   /skills retire ${p.skillId}`));
+    }
+    console.log("");
+    return;
+  }
+
+  // /skills approve <id>
+  if (sub === "approve") {
+    const skillId = parts[2];
+    if (!skillId) { console.log(chalk.red("  Usage: /skills approve <skill-id>\n")); return; }
+    const ok = await ctx.learner.approveSkillManually(skillId, "Approved via /skills approve");
+    if (ok) {
+      console.log(chalk.green(`  ✓ Skill "${skillId}" approved and promoted to trusted.\n`));
+    } else {
+      console.log(chalk.red(`  ✗ Skill "${skillId}" not found.\n`));
+    }
+    return;
+  }
+
+  // /skills retire <id> [reason]
+  if (sub === "retire") {
+    const skillId = parts[2];
+    if (!skillId) { console.log(chalk.red("  Usage: /skills retire <skill-id> [reason]\n")); return; }
+    const reason = parts.slice(3).join(" ") || "Manually retired";
+    const ok = ctx.learner.retireSkill(skillId, reason);
+    if (ok) {
+      console.log(chalk.yellow(`  ✗ Skill "${skillId}" retired: ${reason}\n`));
+    } else {
+      console.log(chalk.red(`  Skill "${skillId}" not found.\n`));
+    }
+    return;
+  }
+
+  // /skills show <id>
+  if (sub === "show") {
+    const skillId = parts[2];
+    const skill = skillId ? ctx.skillStore.get(skillId) : null;
+    if (!skill) { console.log(chalk.red(`  Skill "${skillId}" not found.\n`)); return; }
+    const metrics = ctx.learningDb?.getSkillMetrics(skill.id);
+    const latestEval = ctx.learningDb?.getLatestEval(skill.id);
+    console.log(chalk.cyan(`\n  Skill: ${skill.name} [v${skill.version}] [${skill.status}]\n`));
+    console.log(`  ${chalk.dim("Description:")} ${skill.description}`);
+    console.log(`  ${chalk.dim("Category:")}    ${skill.category}`);
+    console.log(`  ${chalk.dim("Tags:")}        ${skill.tags.join(", ")}`);
+    console.log(`  ${chalk.dim("Triggers:")}    ${skill.triggers.join(", ")}`);
+    console.log(`  ${chalk.dim("Scope:")}       ${skill.scope}${skill.projectId ? ` (${skill.projectId})` : ""}`);
+    console.log(`  ${chalk.dim("Confidence:")}  lower=${(skill.confidence.lower * 100).toFixed(0)}%  point=${(skill.confidence.point * 100).toFixed(0)}%  n=${skill.confidence.n}`);
+    if (metrics) {
+      console.log(`  ${chalk.dim("Metrics:")}     ${metrics.usageCount} uses · ${(metrics.successRate * 100).toFixed(0)}% success · avg $${metrics.avgCostUsd.toFixed(4)} · avg ${metrics.avgDurationMs.toFixed(0)}ms`);
+    }
+    if (latestEval) {
+      const pass = latestEval.passed ? chalk.green("PASS") : chalk.red("FAIL");
+      console.log(`  ${chalk.dim("Last eval:")}   ${pass} score=${(latestEval.score * 100).toFixed(0)}% (${latestEval.evalType})`);
+    }
+    console.log(`\n  ${chalk.dim("Procedure:")}`);
+    console.log(`  ${skill.procedure.replace(/\n/g, "\n  ")}`);
+    if (skill.changelog.length > 0) {
+      console.log(`\n  ${chalk.dim("Recent changes:")}`);
+      for (const c of skill.changelog.slice(-3)) {
+        console.log(`  ${chalk.dim(`v${c.version}:`)} ${c.summary}`);
+      }
+    }
+    console.log("");
+    return;
+  }
+
+  // /skills export [file]
+  if (sub === "export") {
+    const outFile = parts[2] ?? `nexus-skills-${Date.now()}.json`;
+    const exported = ctx.skillStore.export();
+    writeFileSync(outFile, JSON.stringify(exported, null, 2));
+    console.log(chalk.green(`  ✓ Exported ${exported.skills.length} trusted skills to ${outFile}\n`));
+    return;
+  }
+
+  // /skills import <file>
+  if (sub === "import") {
+    const file = parts[2];
+    if (!file || !existsSync(file)) { console.log(chalk.red(`  File not found: ${file}\n`)); return; }
+    try {
+      // Support both .json bundles and .md SKILL.md files
+      if (file.endsWith(".md")) {
+        const result = installFromFile(file);
+        const skill = ctx.skillStore.add(result.skill);
+        console.log(chalk.green(`  ✓ Imported skill "${skill.name}" from SKILL.md (status: draft — use /skills approve to promote)\n`));
+      } else {
+        const data = JSON.parse(readFileSync(file, "utf-8"));
+        const imported = ctx.skillStore.import(data, { importedFrom: file });
+        console.log(chalk.green(`  ✓ Imported ${imported.length} skills (status: draft — use /skills approve to promote)\n`));
+      }
+    } catch (e) {
+      console.log(chalk.red(`  Import failed: ${e}\n`));
+    }
+    return;
+  }
+
+  // /skills install <org/repo> [@branch]
+  // Install skill(s) directly from a GitHub repository
+  if (sub === "install") {
+    const ref = parts[2];
+    if (!ref) {
+      console.log(chalk.red("  Usage: /skills install <org/repo>  or  /skills install <org/repo@branch>\n"));
+      console.log(chalk.dim("  Examples:\n"));
+      console.log(chalk.dim("    /skills install anthropics/nexus-skills\n"));
+      console.log(chalk.dim("    /skills install vercel-labs/skill-pack@main\n"));
+      console.log(chalk.dim("    /skills install https://github.com/org/repo\n"));
+      return;
+    }
+    console.log(chalk.dim(`\n  Installing from GitHub: ${ref}...\n`));
+    try {
+      const installer = new GitHubSkillInstaller();
+      const results = await installer.fetchFromGitHub(ref);
+      let installed = 0;
+      for (const result of results) {
+        // Check for duplicates
+        const existing = ctx.skillStore.getAll().find(
+          (s) => s.name.toLowerCase() === result.skill.name.toLowerCase(),
+        );
+        if (existing) {
+          console.log(chalk.dim(`  ○ Skipped "${result.skill.name}" — already exists (${existing.status})`));
+          continue;
+        }
+        const skill = ctx.skillStore.add(result.skill);
+        console.log(chalk.green(`  ✓ Installed "${chalk.white(skill.name)}" ${chalk.dim(`[${skill.id}]`)}`));
+        console.log(chalk.dim(`     From: ${result.source}`));
+        console.log(chalk.dim(`     Status: draft — run /skills approve ${skill.id} to promote\n`));
+        installed++;
+      }
+      if (installed === 0 && results.length > 0) {
+        console.log(chalk.yellow("  All skills already installed.\n"));
+      } else if (installed > 0) {
+        console.log(chalk.green(`\n  ✓ Installed ${installed} skill(s). Use /skills approve to promote to trusted.\n`));
+      }
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ Install failed: ${err.message}\n`));
+      console.log(chalk.dim("  Tip: Set GITHUB_TOKEN env var to avoid rate limits.\n"));
+    }
+    return;
+  }
+
+  // /skills search <query>
+  // Search the skills.sh / GitHub registry for matching skills
+  if (sub === "search") {
+    const query = parts.slice(2).join(" ");
+    if (!query) {
+      console.log(chalk.red("  Usage: /skills search <query>\n"));
+      console.log(chalk.dim("  Example: /skills search git commit automation\n"));
+      return;
+    }
+    console.log(chalk.dim(`\n  Searching registry for "${query}"...\n`));
+    try {
+      const client = new SkillsShClient();
+      const results = await client.search(query, 10);
+      if (results.length === 0) {
+        console.log(chalk.dim("  No skills found. Try different keywords or /skills browse.\n"));
+        return;
+      }
+      console.log(chalk.cyan(`  ${results.length} result(s) for "${query}":\n`));
+      for (const r of results) {
+        const stars = r.stars != null ? chalk.dim(` ★ ${r.stars}`) : "";
+        console.log(`  ${chalk.white(r.name)}${stars}  ${chalk.dim(r.repo)}`);
+        console.log(`     ${chalk.dim(r.description.slice(0, 100))}`);
+        if (r.tags?.length) console.log(`     ${chalk.dim(r.tags.slice(0, 5).join(" · "))}`);
+        console.log(chalk.dim(`     /skills install ${r.repo}`));
+        console.log("");
+      }
+    } catch (err: any) {
+      console.log(chalk.red(`  Search failed: ${err.message}\n`));
+      console.log(chalk.dim("  Tip: Set GITHUB_TOKEN for authenticated search (higher rate limits).\n"));
+    }
+    return;
+  }
+
+  // /skills browse [category]
+  // Browse top skills from the registry by category
+  if (sub === "browse") {
+    const category = parts[2]?.toLowerCase();
+    const label = category ? `"${category}" skills` : "top agent skills";
+    console.log(chalk.dim(`\n  Browsing ${label} from registry...\n`));
+    try {
+      const client = new SkillsShClient();
+      const results = await client.browse(category, 15);
+      if (results.length === 0) {
+        console.log(chalk.dim("  No skills found in registry. Try /skills search <query>.\n"));
+        return;
+      }
+      const categories = ["coding", "git", "data", "devops", "writing", "research", "security", "files", "web", "testing"];
+      console.log(chalk.cyan(`  📦 ${results.length} skill(s) found:\n`));
+      for (const r of results) {
+        const stars = r.stars != null ? chalk.dim(` ★ ${r.stars}`) : "";
+        console.log(`  ${chalk.white(r.name)}${stars}`);
+        console.log(`     ${chalk.dim(r.description.slice(0, 100))}`);
+        console.log(chalk.dim(`     /skills install ${r.repo}`));
+        console.log("");
+      }
+      console.log(chalk.dim(`  Categories: ${categories.join(" · ")}`));
+      console.log(chalk.dim("  Use /skills browse <category> to filter\n"));
+    } catch (err: any) {
+      console.log(chalk.red(`  Browse failed: ${err.message}\n`));
+    }
+    return;
+  }
+
+  // /skills scan
+  // Scan local .claude/skills/ and .agents/skills/ directories
+  if (sub === "scan") {
+    console.log(chalk.dim("\n  Scanning local skill directories...\n"));
+    const scanner = new SkillsDirScanner();
+    const results = scanner.scan(process.cwd());
+    if (results.length === 0) {
+      console.log(chalk.dim("  No SKILL.md files found in:\n"));
+      console.log(chalk.dim("    .claude/skills/\n    .agents/skills/\n    ~/.claude/skills/\n    ~/.config/agents/skills/\n"));
+      console.log(chalk.dim("  Install skills with /skills install <org/repo> or /skills search <query>\n"));
+      return;
+    }
+    console.log(chalk.cyan(`  Found ${results.length} local SKILL.md file(s):\n`));
+    let imported = 0;
+    for (const result of results) {
+      const existing = ctx.skillStore.getAll().find(
+        (s) => s.name.toLowerCase() === result.skill.name.toLowerCase(),
+      );
+      if (existing) {
+        const icon = STATUS_ICON[existing.status] ?? "?";
+        const color = existing.status === "trusted" ? chalk.green : chalk.yellow;
+        console.log(`  ${color(icon)} ${chalk.white(existing.name)} ${chalk.dim("(already imported)")}`);
+      } else {
+        const skill = ctx.skillStore.add(result.skill);
+        console.log(`  ${chalk.green("+")} ${chalk.white(skill.name)} ${chalk.dim(`← ${result.source}`)}`);
+        imported++;
+      }
+    }
+    if (imported > 0) {
+      console.log(chalk.green(`\n  ✓ Imported ${imported} new skill(s). Use /skills approve to promote.\n`));
+    } else {
+      console.log(chalk.dim("\n  All local skills already imported.\n"));
+    }
+    return;
+  }
+
+  // /skills export-md [id] [output-dir]
+  // Export a skill to SKILL.md format
+  if (sub === "export-md") {
+    const skillId = parts[2];
+    const outputDir = parts[3] ?? ".agents/skills";
+    const scanner = new SkillsDirScanner();
+
+    if (skillId) {
+      const skill = ctx.skillStore.get(skillId);
+      if (!skill) { console.log(chalk.red(`  Skill "${skillId}" not found.\n`)); return; }
+      const filePath = scanner.exportSkill(skill, outputDir);
+      console.log(chalk.green(`  ✓ Exported "${skill.name}" to ${filePath}\n`));
+    } else {
+      // Export all trusted skills
+      const skills = ctx.skillStore.getAll({ status: "trusted" });
+      if (skills.length === 0) { console.log(chalk.dim("  No trusted skills to export.\n")); return; }
+      for (const skill of skills) {
+        const filePath = scanner.exportSkill(skill, outputDir);
+        console.log(chalk.green(`  ✓ ${skill.name} → ${filePath}`));
+      }
+      console.log(chalk.green(`\n  Exported ${skills.length} skill(s) to ${outputDir}/\n`));
+    }
+    return;
+  }
+
+  console.log(chalk.dim(`\n  Unknown subcommand: ${sub}\n`));
+  console.log(chalk.dim("  Usage: /skills [list|pending|approve|retire|show|export|import|install|search|browse|scan|export-md]\n"));
 }
 
 // ── /stats ───────────────────────────────────────────────
@@ -170,12 +488,26 @@ function cmdStats(ctx: SlashCommandContext): void {
   const learnStats = ctx.learner.getStats();
   console.log(chalk.cyan("\n  Intelligence Stats:\n"));
   console.log(chalk.dim(`  Trajectories stored: ${learnStats.trajectoriesStored}`));
-  console.log(chalk.dim(`  Skills created:      ${learnStats.skillsCreated}`));
-  console.log(chalk.dim(`  Skill mutations:     ${learnStats.skillsMutated}`));
+  if (learnStats.outcomeBreakdown) {
+    const ob = learnStats.outcomeBreakdown;
+    console.log(chalk.dim(`    success: ${ob.success ?? 0}  partial: ${ob.partial ?? 0}  failure: ${ob.failure ?? 0}  unknown: ${ob.unknown ?? 0}`));
+  }
+  console.log(chalk.dim(`  Skills by status:`));
+  for (const [status, count] of Object.entries(learnStats.skillsByStatus ?? {})) {
+    const icon = STATUS_ICON[status] ?? "?";
+    console.log(chalk.dim(`    ${icon} ${status}: ${count}`));
+  }
+  console.log(chalk.dim(`  Pending approvals:   ${learnStats.pendingApprovals ?? 0}`));
   console.log(chalk.dim(`  Routing decisions:   ${routerStats.total}`));
-  console.log(chalk.dim(`    System 1 (fast):   ${routerStats.system1}`));
+  console.log(chalk.dim(`    System 1 (fast):   ${routerStats.system1} (${(routerStats.system1Pct * 100).toFixed(1)}%)`));
   console.log(chalk.dim(`    System 2 (full):   ${routerStats.system2}`));
-  console.log(chalk.dim(`  Est. cost saved:     $${routerStats.costSaved.toFixed(4)}`));
+  if (ctx.learningDb) {
+    const benchReport = ctx.learningDb.getBenchmarkReport();
+    if (benchReport.totalRuns > 0) {
+      const savings = Math.max(0, benchReport.avgCostSystem2 - benchReport.avgCostSystem1);
+      console.log(chalk.dim(`  Benchmark cost savings: $${savings.toFixed(4)}/task via System 1`));
+    }
+  }
   console.log("");
 }
 
@@ -423,6 +755,91 @@ export function handleCronCommand(parts: string[], cronStore: CronStore): void {
   console.log(chalk.dim("\n  Usage: /cron [list|delete <id>|enable <id>|disable <id>]\n"));
 }
 
+// ── /wiki ─────────────────────────────────────────────────
+
+export function handleWikiCommand(parts: string[]): void {
+  const store = new WikiStore(NEXUS_HOME);
+  const sub = parts[1]?.toLowerCase();
+
+  if (!sub || sub === "index") {
+    const index = store.readIndex();
+    console.log(chalk.cyan("\n  Wiki Index:\n"));
+    const lines = index.split("\n").slice(0, 40);
+    for (const l of lines) console.log("  " + chalk.dim(l));
+    if (index.split("\n").length > 40) console.log(chalk.dim("  ... (truncated)"));
+    console.log("");
+    return;
+  }
+
+  if (sub === "search") {
+    const query = parts.slice(2).join(" ");
+    if (!query) { console.log(chalk.red("\n  Usage: /wiki search <query>\n")); return; }
+    const results = store.search(query);
+    if (results.length === 0) {
+      console.log(chalk.dim(`\n  No wiki pages found for "${query}".\n`));
+      return;
+    }
+    console.log(chalk.cyan(`\n  ${results.length} result(s) for "${query}":\n`));
+    for (const p of results.slice(0, 15)) {
+      console.log(`  ${chalk.white(p.path)}`);
+      if (p.summary) console.log(`     ${chalk.dim(p.summary.slice(0, 80))}`);
+    }
+    console.log("");
+    return;
+  }
+
+  if (sub === "list") {
+    const category = parts[2];
+    const pages = store.listPages(category);
+    if (pages.length === 0) {
+      console.log(chalk.dim(`\n  No wiki pages${category ? ` in "${category}"` : ""}.\n`));
+      return;
+    }
+    console.log(chalk.cyan(`\n  ${pages.length} Wiki Page(s)${category ? ` in "${category}"` : ""}:\n`));
+    const sorted = pages.sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const p of sorted.slice(0, 30)) {
+      const date = new Date(p.updatedAt).toISOString().slice(0, 10);
+      const size = `${Math.round(p.size / 1024 * 10) / 10}KB`;
+      console.log(`  ${chalk.white(p.path)} ${chalk.dim(`(${size}, ${date})`)}`);
+      if (p.summary) console.log(`     ${chalk.dim(p.summary.slice(0, 80))}`);
+    }
+    if (pages.length > 30) console.log(chalk.dim(`  ... and ${pages.length - 30} more`));
+    console.log("");
+    return;
+  }
+
+  if (sub === "lint") {
+    console.log(chalk.dim("\n  Running wiki lint...\n"));
+    const issues = store.lint();
+    if (issues.length === 0) {
+      console.log(chalk.green("  ✓ Wiki lint passed — no issues found.\n"));
+      return;
+    }
+    const byLevel = { error: chalk.red, warn: chalk.yellow, info: chalk.dim };
+    console.log(chalk.cyan(`  ${issues.length} issue(s):\n`));
+    for (const i of issues) {
+      const color = byLevel[i.severity] ?? chalk.white;
+      console.log(`  ${color(`[${i.severity}]`)} ${chalk.white(i.page)}: ${chalk.dim(i.message)}`);
+    }
+    console.log("");
+    return;
+  }
+
+  if (sub === "read") {
+    const page = parts.slice(2).join(" ");
+    if (!page) { console.log(chalk.red("\n  Usage: /wiki read <page-path>\n")); return; }
+    const content = store.readPage(page);
+    console.log(chalk.cyan(`\n  ${page}:\n`));
+    const lines = content.split("\n").slice(0, 50);
+    for (const l of lines) console.log("  " + chalk.dim(l));
+    if (content.split("\n").length > 50) console.log(chalk.dim("  ... (truncated, use wiki_read tool for full content)"));
+    console.log("");
+    return;
+  }
+
+  console.log(chalk.dim("\n  Usage: /wiki [index|search <q>|list [category]|lint|read <page>]\n"));
+}
+
 // ── Main dispatcher ───────────────────────────────────────
 
 export async function handleSlashCommand(input: string, ctx: SlashCommandContext): Promise<boolean> {
@@ -456,7 +873,19 @@ export async function handleSlashCommand(input: string, ctx: SlashCommandContext
       return true;
 
     case "/skills":
-      cmdSkills(ctx);
+      await cmdSkills(parts, ctx);
+      return true;
+
+    case "/thumbsup":
+    case "/👍":
+      ctx.learner.applyUserFeedback("positive");
+      console.log(chalk.green("  ✓ Feedback recorded: positive. Learning updated.\n"));
+      return true;
+
+    case "/thumbsdown":
+    case "/👎":
+      ctx.learner.applyUserFeedback("negative");
+      console.log(chalk.yellow("  ✓ Feedback recorded: negative. Learning updated.\n"));
       return true;
 
     case "/stats":
@@ -483,6 +912,14 @@ export async function handleSlashCommand(input: string, ctx: SlashCommandContext
       cmdConfig();
       return true;
 
+    case "/doctor":
+      printDoctorReport(validateConfig());
+      return true;
+
+    case "/setup":
+      printSetupReport();
+      return true;
+
     case "/mcp":
       if (!ctx.mcpManager || !ctx.mcpConfigStore) {
         console.log(chalk.dim("\n  MCP not initialized.\n"));
@@ -497,6 +934,10 @@ export async function handleSlashCommand(input: string, ctx: SlashCommandContext
       } else {
         handleCronCommand(parts, ctx.cronStore);
       }
+      return true;
+
+    case "/wiki":
+      handleWikiCommand(parts);
       return true;
 
     case "/exit":

@@ -63,21 +63,55 @@ import {
   systemTools,
 } from "./system.js";
 
+import {
+  wikiReadTool,
+  wikiWriteTool,
+  wikiLogTool,
+  wikiMetadataTool,
+  wikiSearchTool,
+  wikiListTool,
+  wikiLintTool,
+  wikiIngestTool,
+  wikiSaveSessionTool,
+  wikiTools,
+  initWikiTools,
+} from "./wiki.js";
+
+import {
+  wikiRecallTool,
+  wikiSimilarTool,
+  wikiObserveTool,
+  wikiMemoryTools,
+} from "./wiki-memory.js";
+
+import { createPlannerTools, initPlannerTools, PlanStore } from "./planner.js";
+
+// Planner tools are initialized lazily via initPlannerTools()
+// but we expose a default set for environments that don't call init
+const _defaultPlannerTools = createPlannerTools(new PlanStore(
+  process.env["NEXUS_HOME"]
+    ? `${process.env["NEXUS_HOME"]}/tasks`
+    : `${process.env["HOME"] ?? "/tmp"}/.nexus/tasks`,
+));
+
 // ── All built-in tools ────────────────────────────────────
 
 /** The complete set of built-in tools available to the agent */
 export const builtinTools: Tool[] = [
-  ...filesystemTools,   // read_file, write_file, patch_file, list_files, search_files
-  ...terminalTools,     // shell, process_status
-  ...gitTools,          // git_status, git_diff, git_commit, git_log, git_branch
-  ...webTools,          // web_search, fetch_url
-  ...networkTools,      // http_request, download_file, check_url
-  ...codeTools,         // run_code
-  ...imageTools,        // generate_image
-  ...visionTools,       // analyze_image, read_text_from_image
-  ...browserTools,      // screenshot_url, scrape_page, browser_click, browser_fill, browser_eval
-  ...dataTools,         // read_csv, read_json, write_json, query_sqlite, read_pdf, read_xml
-  ...systemTools,       // notify, clipboard_read, clipboard_write, system_info, open_url, zip, unzip, get_env
+  ...filesystemTools,      // read_file, write_file, patch_file, list_files, search_files
+  ...terminalTools,        // shell, process_status
+  ...gitTools,             // git_status, git_diff, git_commit, git_log, git_branch
+  ...webTools,             // web_search, fetch_url
+  ...networkTools,         // http_request, download_file, check_url
+  ...codeTools,            // run_code
+  ...imageTools,           // generate_image
+  ...visionTools,          // analyze_image, read_text_from_image
+  ...browserTools,         // screenshot_url, scrape_page, browser_click, browser_fill, browser_eval
+  ...dataTools,            // read_csv, read_json, write_json, query_sqlite, read_pdf, read_xml
+  ...systemTools,          // notify, clipboard_read, clipboard_write, system_info, open_url, zip, unzip, get_env
+  ...wikiTools,            // wiki_read, wiki_write, wiki_log, wiki_search, wiki_list, wiki_lint, wiki_ingest, wiki_save_session
+  ...wikiMemoryTools,      // wiki_recall, wiki_similar, wiki_observe
+  ..._defaultPlannerTools, // task_plan, task_update, task_list, task_complete, task_checkpoint
 ];
 
 // ── Re-exports ────────────────────────────────────────────
@@ -118,3 +152,18 @@ export {
   notifyTool, clipboardReadTool, clipboardWriteTool, systemInfoTool,
   openUrlTool, zipTool, unzipTool, getEnvTool, systemTools,
 };
+
+// Wiki
+export {
+  wikiReadTool, wikiWriteTool, wikiLogTool, wikiMetadataTool, wikiSearchTool, wikiListTool,
+  wikiLintTool, wikiIngestTool, wikiSaveSessionTool, wikiTools, initWikiTools,
+};
+
+// Wiki memory (FTS5 semantic search + user modelling)
+export {
+  wikiRecallTool, wikiSimilarTool, wikiObserveTool, wikiMemoryTools,
+};
+
+// Task Planner
+export { createPlannerTools, initPlannerTools, PlanStore };
+export type { TaskPlan, PlanStep, StepStatus } from "./planner.js";

@@ -5,6 +5,9 @@
  */
 
 import { describe, it, expect } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   budgetEnforcer,
   iterationLimiter,
@@ -12,7 +15,10 @@ import {
   outputScanner,
   timing,
   logger,
+  memoryContextBuilder,
+  afterAgentHooks,
 } from "../../packages/core/src/middleware.js";
+import { WikiStore } from "../../packages/core/src/wiki.js";
 import type { AgentContext, Message } from "../../packages/core/src/types.js";
 
 function makeContext(overrides?: Partial<AgentContext>): AgentContext {
@@ -40,6 +46,11 @@ function makeContext(overrides?: Partial<AgentContext>): AgentContext {
       this.shouldStop = true;
       this.meta["abortReason"] = reason;
     },
+    redirect: function (newMessage: string) {
+      this.shouldStop = true;
+      this.meta["redirect"] = newMessage;
+    },
+    artifacts: [],
     ...overrides,
   };
 }
@@ -143,7 +154,7 @@ describe("Output Scanner Middleware", () => {
     });
 
     await mw.execute(ctx, async () => {});
-    
+
     const assistantMsg = ctx.messages.find((m) => m.role === "assistant");
     expect(assistantMsg?.content).toContain("[REDACTED]");
     expect(ctx.meta["output_redacted"]).toBe(true);
@@ -229,5 +240,248 @@ describe("Middleware Chain (Onion Model)", () => {
       "inner-after",
       "outer-after",
     ]);
+  });
+});
+
+describe("Memory Context Builder Middleware", () => {
+  function makeWikiHome(): string {
+    return mkdtempSync(join(tmpdir(), "nexus-memory-context-"));
+  }
+
+  it("should inject bounded retrieved wiki memory before the LLM runs", async () => {
+    const home = makeWikiHome();
+    try {
+      const store = new WikiStore(home);
+      store.writePage(
+        "user/profile.md",
+        [
+          "# User Profile",
+          "",
+          "> User preferences, working style, and context.",
+          "",
+          "Updated: 2026-04-13",
+          "",
+          "## Preferences",
+          "",
+          "- Prefers concise implementation notes with concrete validation.",
+        ].join("\n"),
+      );
+      store.writePage(
+        "projects/nexus/overview.md",
+        [
+          "# Nexus Overview",
+          "",
+          "> Nexus TypeScript agent monorepo.",
+          "",
+          "Updated: 2026-04-13",
+          "",
+          "Nexus uses wiki memory for persistent project facts.",
+        ].join("\n"),
+      );
+      store.writePage(
+        "concepts/wiki-memory.md",
+        [
+          "# Wiki Memory",
+          "",
+          "> FTS5 retrieval over synthesized wiki pages.",
+          "",
+          "Updated: 2026-04-13",
+          "",
+          "The wiki memory context builder recalls relevant pages before the model runs.",
+        ].join("\n"),
+        undefined,
+        {
+          type: "concept",
+          confidence: 0.9,
+          citations: [{
+            sourceType: "session",
+            sourcePath: "/tmp/raw-session.md",
+            sourceId: "session-test",
+            quote: "The wiki memory context builder recalls relevant pages before the model runs.",
+            timestamp: "2026-04-13T00:00:00.000Z",
+          }],
+        },
+      );
+
+      const mw = memoryContextBuilder({
+        nexusHome: home,
+        project: "nexus",
+        maxResults: 3,
+        maxContextChars: 4_000,
+      });
+      const ctx = makeContext({
+        messages: [
+          { role: "system", content: "base system" },
+          { role: "user", content: "How should Nexus use wiki memory?" },
+        ],
+      });
+
+      let nextSawMemory = false;
+      await mw.execute(ctx, async () => {
+        nextSawMemory = ctx.messages.some(
+          (m) => m.role === "system" && m.content.includes("## Retrieved Memory"),
+        );
+      });
+
+      expect(nextSawMemory).toBe(true);
+      const memoryMessage = ctx.messages.find((m) => m.content.includes("## Retrieved Memory"));
+      expect(memoryMessage?.content).toContain("Source: `user/profile.md`");
+      expect(memoryMessage?.content).toContain("Source: `projects/nexus/overview.md`");
+      expect(memoryMessage?.content).toContain("Source: `concepts/wiki-memory.md`");
+      expect(memoryMessage?.content).toContain("Citation: session `/tmp/raw-session.md#session-test`");
+      expect(memoryMessage?.content).toContain("cite the source path");
+      expect(ctx.messages[0].content).toBe("base system");
+      expect(ctx.messages[1]).toBe(memoryMessage!);
+      expect((ctx.meta["memoryContext"] as { sourceCount: number }).sourceCount).toBeGreaterThanOrEqual(3);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("should skip injection when the wiki only has placeholder memory", async () => {
+    const home = makeWikiHome();
+    try {
+      const mw = memoryContextBuilder({ nexusHome: home, project: "nexus" });
+      const ctx = makeContext({
+        messages: [
+          { role: "system", content: "base system" },
+          { role: "user", content: "unmatched query with no wiki facts" },
+        ],
+      });
+
+      await mw.execute(ctx, async () => {});
+
+      expect(ctx.messages.some((m) => m.content.includes("## Retrieved Memory"))).toBe(false);
+      expect((ctx.meta["memoryContext"] as { sourceCount: number }).sourceCount).toBe(0);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("should cap the injected memory block to the configured context budget", async () => {
+    const home = makeWikiHome();
+    try {
+      const store = new WikiStore(home);
+      store.writePage(
+        "user/profile.md",
+        [
+          "# User Profile",
+          "",
+          "> User preferences, working style, and context.",
+          "",
+          "Updated: 2026-04-13",
+          "",
+          "The user has a long-running memory preference. " + "memory ".repeat(2_000),
+        ].join("\n"),
+      );
+
+      const mw = memoryContextBuilder({
+        nexusHome: home,
+        includeUserProfile: true,
+        maxResults: 2,
+        maxSnippetChars: 5_000,
+        maxContextChars: 900,
+      });
+      const ctx = makeContext({
+        messages: [
+          { role: "system", content: "base system" },
+          { role: "user", content: "memory" },
+        ],
+      });
+
+      await mw.execute(ctx, async () => {});
+
+      const memoryMessage = ctx.messages.find((m) => m.content.includes("## Retrieved Memory"));
+      expect(memoryMessage).toBeDefined();
+      expect(memoryMessage!.content.length).toBeLessThanOrEqual(980);
+      expect(memoryMessage!.content).toContain("truncated");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Wiki Session Archive Hook", () => {
+  function makeWikiHome(): string {
+    return mkdtempSync(join(tmpdir(), "nexus-session-archive-"));
+  }
+
+  it("should archive raw transcript and write a wiki session summary", async () => {
+    const home = makeWikiHome();
+    try {
+      const hook = afterAgentHooks.archiveSessionToWiki({
+        nexusHome: home,
+        project: "nexus",
+        maxArtifacts: 5,
+      });
+      const ctx = makeContext({
+        sessionId: "session_1234567890",
+        messages: [
+          { role: "system", content: "base system" },
+          { role: "system", content: "## Retrieved Memory\n\nSource: `user/profile.md`" },
+          { role: "user", content: "Build session archiving for wiki memory." },
+          { role: "assistant", content: "Implemented session archiving. Next: add memory evals." },
+        ],
+        budget: {
+          limitUsd: 1,
+          spentUsd: 0.0123,
+          tokensIn: 100,
+          tokensOut: 80,
+          llmCalls: 1,
+          toolCalls: 2,
+        },
+        artifacts: [
+          { type: "file_write", path: "packages/core/src/middleware.ts", timestamp: Date.now(), summary: "updated middleware" },
+          { type: "command_run", command: "bun test", timestamp: Date.now(), summary: "exit 0" },
+        ],
+      });
+
+      await hook(ctx);
+
+      const archiveMeta = ctx.meta["wikiSessionArchive"] as { archived: boolean; rawPath: string; summaryPath: string };
+      expect(archiveMeta.archived).toBe(true);
+      expect(existsSync(archiveMeta.rawPath)).toBe(true);
+      expect(archiveMeta.summaryPath).toStartWith("sessions/");
+
+      const store = new WikiStore(home);
+      const raw = readFileSync(archiveMeta.rawPath, "utf-8");
+      const summary = store.readPage(archiveMeta.summaryPath);
+      const metadata = store.getMetadata(archiveMeta.summaryPath);
+      const log = store.readPage("log.md");
+      const index = store.readPage("index.md");
+
+      expect(raw).toContain("Build session archiving for wiki memory.");
+      expect(raw).not.toContain("## Retrieved Memory");
+      expect(summary).toContain("# Session: Build session archiving for wiki memory.");
+      expect(summary).toContain("Raw transcript:");
+      expect(summary).toContain("packages/core/src/middleware.ts");
+      expect(summary).toContain("Next: add memory evals.");
+      expect(metadata?.type).toBe("session_summary");
+      expect(metadata?.project).toBe("nexus");
+      expect(metadata?.citations[0]?.sourceType).toBe("session");
+      expect(metadata?.citations[0]?.sourceId).toBe("session_1234567890");
+      expect(log).toContain("Archived raw transcript");
+      expect(index).toContain(archiveMeta.summaryPath);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("should skip archiving when there are no user messages", async () => {
+    const home = makeWikiHome();
+    try {
+      const hook = afterAgentHooks.archiveSessionToWiki({ nexusHome: home });
+      const ctx = makeContext({
+        messages: [{ role: "system", content: "base system" }],
+      });
+
+      await hook(ctx);
+
+      const archiveMeta = ctx.meta["wikiSessionArchive"] as { archived: boolean; skipped: string };
+      expect(archiveMeta.archived).toBe(false);
+      expect(archiveMeta.skipped).toBe("no_user_messages");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

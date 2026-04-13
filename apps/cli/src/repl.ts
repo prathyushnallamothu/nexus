@@ -11,7 +11,7 @@ import chalk from "chalk";
 import type { Message, Tool } from "@nexus/core";
 import type { McpManager, McpConfigStore } from "@nexus/protocols";
 import type { CronStore } from "@nexus/runtime";
-import type { SkillStore, DualProcessRouter, ExperienceLearner } from "@nexus/intelligence";
+import type { SkillStore, DualProcessRouter, ExperienceLearner, LearningDB } from "@nexus/intelligence";
 import type { AuditLogger } from "@nexus/governance";
 import { handleSlashCommand, type SlashCommandContext } from "./commands.js";
 import { createProcessor, type ProcessorDeps } from "./agent-runner.js";
@@ -26,6 +26,7 @@ export interface ReplDeps extends ProcessorDeps {
   skillStore: SkillStore;
   router: DualProcessRouter;
   learner: ExperienceLearner;
+  learningDb?: LearningDB;
   auditLogger: AuditLogger;
   mcpManager: McpManager | null;
   mcpConfigStore: McpConfigStore | null;
@@ -110,6 +111,7 @@ export function startRepl(deps: ReplDeps): RLInterface {
     skillStore: deps.skillStore,
     router: deps.router,
     learner: deps.learner,
+    learningDb: deps.learningDb,
     auditLogger: deps.auditLogger,
     mcpManager: deps.mcpManager,
     mcpConfigStore: deps.mcpConfigStore,

@@ -15,6 +15,12 @@ import {
   outputScanner,
   timing,
   logger,
+  memoryContextBuilder,
+  artifactTracker,
+  toolCompactor,
+  afterAgent,
+  afterAgentHooks,
+  initPlannerTools,
 } from "@nexus/core";
 import { createProvider, parseModelString } from "@nexus/providers";
 import {
@@ -23,6 +29,8 @@ import {
   System1Executor,
   ExperienceLearner,
   ModeManager,
+  LearningDB,
+  SkillEvaluator,
 } from "@nexus/intelligence";
 import {
   AuditLogger,
@@ -36,19 +44,38 @@ import {
 import { McpConfigStore, McpManager, createMcpManagementTools } from "@nexus/protocols";
 import { CronStore, CronRunner, createCronTools } from "@nexus/runtime";
 import type { CronJob, CronRunResult } from "@nexus/runtime";
+import { initWikiTools } from "@nexus/core";
 
 import { DEFAULT_MODEL, BUDGET_USD, NEXUS_HOME, SYSTEM_PROMPT, loadProjectContext } from "./config.js";
+import {
+  hasBlockingConfigIssue,
+  installCrashHandlers,
+  printDoctorReport,
+  printSetupReport,
+  validateConfig,
+  writeStructuredLog,
+} from "./diagnostics.js";
 import { createCombinedHandler } from "./events.js";
 import { printBanner } from "./banner.js";
 import { startRepl } from "./repl.js";
 
+// ── Wiki ──────────────────────────────────────────────────
+// Must be initialised before builtinTools are used.
+initWikiTools(NEXUS_HOME);
+
 // ── Intelligence Layer ────────────────────────────────────
 
-const skillStore  = new SkillStore(join(NEXUS_HOME, "skills"));
-const router      = new DualProcessRouter(skillStore);
-const modeManager = new ModeManager(resolve(process.cwd(), "modes"));
 const provider    = createProvider(parseModelString(DEFAULT_MODEL));
-const learner     = new ExperienceLearner(provider, skillStore);
+const skillStore  = new SkillStore(join(NEXUS_HOME, "skills"));
+const learningDb  = new LearningDB(join(NEXUS_HOME, "learning.db"));
+const evaluator   = new SkillEvaluator(learningDb, provider);
+const router      = new DualProcessRouter(skillStore, undefined, learningDb);
+const modeManager = new ModeManager(resolve(process.cwd(), "modes"));
+const learner     = new ExperienceLearner(provider, skillStore, learningDb, evaluator, {
+  autoApprove: true,          // promote passing skills automatically
+  runShadowEval: false,       // shadow eval costs LLM tokens — enable in high-stakes setups
+  retirementSuccessThreshold: 0.4,
+});
 const system1     = new System1Executor(provider);
 
 // ── Governance Layer ──────────────────────────────────────
@@ -71,6 +98,12 @@ const monitor = new BehavioralMonitor({}, (alert) => {
 // ── Main ──────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  const configChecks = validateConfig();
+  if (hasBlockingConfigIssue(configChecks)) {
+    printDoctorReport(configChecks);
+    console.log(chalk.yellow("  Continuing in REPL mode. Provider calls may fail until configuration issues are fixed.\n"));
+  }
+
   const projectContext = loadProjectContext();
 
   // ── MCP ───────────────────────────────────────────────
@@ -99,11 +132,17 @@ async function main(): Promise<void> {
     }
   }
 
-  const mcpTools     = mcpManager.getAllTools();
-  const mcpMgmtTools = createMcpManagementTools(mcpConfigStore, mcpManager);
-  const cronStore    = new CronStore(join(NEXUS_HOME, "cron"));
-  const cronTools    = createCronTools(cronStore);
-  const allTools     = [...builtinTools, ...mcpTools, ...mcpMgmtTools, ...cronTools];
+  const mcpTools      = mcpManager.getAllTools();
+  const mcpMgmtTools  = createMcpManagementTools(mcpConfigStore, mcpManager);
+  const cronStore     = new CronStore(join(NEXUS_HOME, "cron"));
+  const cronTools     = createCronTools(cronStore);
+  const plannerTools  = initPlannerTools(join(NEXUS_HOME, "tasks"));
+  // plannerTools replace the default planner tools already in builtinTools
+  // (which use env-var paths). Filter them out and use the properly-pathed ones.
+  const coreTools     = builtinTools.filter(
+    (t) => !["task_plan","task_update","task_list","task_complete","task_checkpoint"].includes(t.schema.name),
+  );
+  const allTools      = [...coreTools, ...mcpTools, ...mcpMgmtTools, ...cronTools, ...plannerTools];
 
   // ── Agent ─────────────────────────────────────────────
   const combinedEventHandler = createCombinedHandler(auditLogger, monitor);
@@ -117,11 +156,19 @@ async function main(): Promise<void> {
         timing(),
         monitorMiddleware(monitor),
         promptFirewall(),
+        memoryContextBuilder({ nexusHome: NEXUS_HOME }),
         budgetEnforcer({ limitUsd: BUDGET_USD }),
         permissionMiddleware(permissionGuard),
         supervisionMiddleware(supervisor),
+        artifactTracker(),          // record files/commands/URLs as artifacts
+        toolCompactor(),            // truncate huge tool outputs before they blow context
         outputScanner(),
         logger({ verbose: false }),
+        afterAgent([               // deterministic hooks that run after the loop
+          afterAgentHooks.noteFileChanges,
+          afterAgentHooks.archiveSessionToWiki({ nexusHome: NEXUS_HOME }),
+          afterAgentHooks.suggestCommitIfChanged,
+        ]),
       ],
       maxIterations: 25,
       maxContextTokens: 128_000,
@@ -145,6 +192,12 @@ async function main(): Promise<void> {
   cronRunner.start();
 
   printBanner(skillStore, router, modeManager);
+  writeStructuredLog("info", "cli.started", {
+    model: DEFAULT_MODEL,
+    budgetUsd: BUDGET_USD,
+    cwd: process.cwd(),
+    nexusHome: NEXUS_HOME,
+  });
 
   // ── REPL ──────────────────────────────────────────────
   startRepl({
@@ -155,18 +208,36 @@ async function main(): Promise<void> {
     learner,
     modeManager,
     skillStore,
+    learningDb,
     auditLogger,
     mcpManager,
     mcpConfigStore,
     cronStore,
     onShutdown: async () => {
       cronRunner.stop();
+      learningDb.close();
       await mcpManager.disconnectAll().catch(() => {});
     },
   });
 }
 
-main().catch((err) => {
-  console.error(chalk.red(`Fatal: ${err}`));
-  process.exit(1);
-});
+installCrashHandlers();
+
+const command = process.argv[2]?.toLowerCase();
+if (command === "doctor") {
+  const checks = validateConfig();
+  printDoctorReport(checks);
+  process.exit(hasBlockingConfigIssue(checks) ? 1 : 0);
+} else if (command === "setup" || command === "onboard") {
+  printSetupReport();
+  process.exit(0);
+} else {
+  main().catch((err) => {
+    writeStructuredLog("error", "cli.fatal", {
+      message: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    });
+    console.error(chalk.red(`Fatal: ${err}`));
+    process.exit(1);
+  });
+}

@@ -5,3 +5,4 @@ export * from "./observability.js";
 export * from "./db.js";
 export * from "./cron.js";
 export * from "./cron-tools.js";
+// WikiStore is exported from @nexus/core — import it from there directly.

@@ -8,6 +8,11 @@ import {
   outputScanner,
   timing,
   logger,
+  memoryContextBuilder,
+  artifactTracker,
+  afterAgent,
+  afterAgentHooks,
+  initWikiTools,
 } from "@nexus/core";
 import { createProvider, parseModelString } from "@nexus/providers";
 import {
@@ -15,6 +20,8 @@ import {
   DualProcessRouter,
   System1Executor,
   ExperienceLearner,
+  LearningDB,
+  SkillEvaluator,
 } from "@nexus/intelligence";
 import {
   AuditLogger,
@@ -43,12 +50,15 @@ const BUDGET_USD = parseFloat(process.env.NEXUS_BUDGET ?? "2.0");
 const NEXUS_HOME = join(process.cwd(), ".nexus");
 
 if (!existsSync(NEXUS_HOME)) mkdirSync(NEXUS_HOME, { recursive: true });
+initWikiTools(NEXUS_HOME);
 
 const skillStore = new SkillStore(join(NEXUS_HOME, "skills"));
-const router = new DualProcessRouter(skillStore);
 const providerConfig = parseModelString(DEFAULT_MODEL);
 const provider = createProvider(providerConfig);
-const learner = new ExperienceLearner(provider, skillStore);
+const learningDb = new LearningDB(join(NEXUS_HOME, "learning.db"));
+const evaluator = new SkillEvaluator(learningDb, provider);
+const router = new DualProcessRouter(skillStore, undefined, learningDb);
+const learner = new ExperienceLearner(provider, skillStore, learningDb, evaluator);
 const system1 = new System1Executor(provider);
 
 const auditLogger = new AuditLogger(join(NEXUS_HOME, "audit"));
@@ -72,11 +82,17 @@ const agent = new NexusAgent({
       timing(),
       monitorMiddleware(monitor),
       promptFirewall(),
+      memoryContextBuilder({ nexusHome: NEXUS_HOME }),
       budgetEnforcer({ limitUsd: BUDGET_USD }),
       permissionMiddleware(permissionGuard),
       supervisionMiddleware(supervisor),
+      artifactTracker(),
       outputScanner(),
       logger({ verbose: true }),
+      afterAgent([
+        afterAgentHooks.noteFileChanges,
+        afterAgentHooks.archiveSessionToWiki({ nexusHome: NEXUS_HOME }),
+      ]),
     ],
     maxIterations: 10,
     maxContextTokens: 32000,
@@ -95,7 +111,7 @@ const sessionMemories = new Map<string, any[]>();
 // Wire gateway to agent
 gateway.onMessage(async (msg) => {
   console.log(`[GATEWAY] Received msg from ${msg.surface} [${msg.threadId}]`);
-  
+
   if (!sessionMemories.has(msg.threadId)) {
     sessionMemories.set(msg.threadId, []);
   }
@@ -113,15 +129,20 @@ gateway.onMessage(async (msg) => {
       const result = await agent.run(msg.content, history);
       responseText = result.response;
       history.push(...result.messages.filter((m: any) => m.role !== "system"));
-      
+
       // Background learn
       learner.learn({
         task: msg.content,
         messages: history,
-        outcome: "success",
+        outcome: "unknown",
+        outcomeReason: "",
+        outcomeConfidence: 0,
         budget: result.budget,
         durationMs: 0,
         routingPath: "system2",
+        artifacts: result.artifacts,
+        hitIterationLimit: result.hitIterationLimit ?? false,
+        sessionId: msg.threadId,
         timestamp: Date.now(),
       }).catch(console.error);
     }
@@ -171,8 +192,8 @@ app.post("/api/webhooks/slack", async (c) => {
       content: body.event.text,
       timestamp: parseFloat(body.event.ts) * 1000,
     };
-    
-    // In production, we'd fire & forget and POST back to Slack API. 
+
+    // In production, we'd fire & forget and POST back to Slack API.
     // For demo, we just dispatch and log.
     gateway.dispatch(normalized).then(reply => {
       console.log(`[Slack Reply Mock] To ${normalized.threadId}: ${reply}`);

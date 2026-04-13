@@ -28,10 +28,10 @@ import {
   promptFirewall,
   outputScanner,
   timing,
-} from "../packages/core/src/index.ts";
-import { createProvider, parseModelString } from "../packages/providers/src/index.ts";
-import { SkillStore, DualProcessRouter, System1Executor, ExperienceLearner } from "../packages/intelligence/src/index.ts";
-import { AuditLogger, PromptFirewall } from "../packages/governance/src/index.ts";
+} from "@nexus/core";
+import { createProvider, parseModelString } from "@nexus/providers";
+import { SkillStore, DualProcessRouter, System1Executor, ExperienceLearner, LearningDB, SkillEvaluator } from "@nexus/intelligence";
+import { AuditLogger, PromptFirewall } from "@nexus/governance";
 
 // ── Config ─────────────────────────────────────────────────
 
@@ -43,10 +43,12 @@ mkdirSync(BENCH_HOME, { recursive: true });
 // ── Setup ──────────────────────────────────────────────────
 
 const skillStore = new SkillStore(join(BENCH_HOME, "skills"));
-const router = new DualProcessRouter(skillStore);
 const providerConfig = parseModelString(MODEL);
 const provider = createProvider(providerConfig);
-const learner = new ExperienceLearner(provider, skillStore);
+const learningDb = new LearningDB(join(BENCH_HOME, "learning.db"));
+const evaluator = new SkillEvaluator(learningDb, provider);
+const router = new DualProcessRouter(skillStore, undefined, learningDb);
+const learner = new ExperienceLearner(provider, skillStore, learningDb, evaluator);
 const system1 = new System1Executor(provider);
 const auditLogger = new AuditLogger(join(BENCH_HOME, "audit"));
 const firewall = new PromptFirewall();
@@ -146,9 +148,10 @@ function section(title: string) {
   console.log(c("dim", "  " + "─".repeat(90)));
 }
 
-// ══════════════════════════════════════════════════════════
+async function main(): Promise<void> {
+// =================================================================
 // CATEGORY 1: Routing Accuracy
-// ══════════════════════════════════════════════════════════
+// =================================================================
 
 section("Category 1 — Dual-Process Routing Accuracy");
 
@@ -168,7 +171,7 @@ for (const task of [
     tokensIn: 0,
     tokensOut: 0,
     routingPath: decision.path,
-    notes: `confidence=${decision.confidence?.toFixed(2) ?? "n/a"}, skillMatch=${decision.skillMatch?.name ?? "none"}`,
+    notes: `confidence=${decision.skillMatch?.confidence.toFixed(2) ?? "n/a"}, skillMatch=${decision.skillMatch?.skill.name ?? "none"}`,
   });
 }
 
@@ -200,7 +203,7 @@ for (const tc of injectionCases) {
     tokensIn: 0,
     tokensOut: 0,
     routingPath: "n/a",
-    notes: `expected=${tc.expectBlocked ? "blocked" : "allowed"}, got=${wasBlocked ? "blocked" : "allowed"}${result.matches?.[0] ? ` (${result.matches[0].type})` : ""}`,
+    notes: `expected=${tc.expectBlocked ? "blocked" : "allowed"}, got=${wasBlocked ? "blocked" : "allowed"}${result.matchedPattern ? ` (${result.matchedPattern})` : ""}`,
   });
 }
 
@@ -320,10 +323,15 @@ for (const lt of liveTasks) {
     learner.learn({
       task: lt.task,
       messages: [{ role: "user", content: lt.task }, { role: "assistant", content: response }],
-      outcome: "success",
+      outcome: "unknown",
+      outcomeReason: "",
+      outcomeConfidence: 0,
       budget: { limitUsd: 5, spentUsd: costUsd, tokensIn, tokensOut, llmCalls: 1, toolCalls: 0 },
       durationMs: latencyMs,
       routingPath: decision.path,
+      artifacts: [],
+      hitIterationLimit: false,
+      sessionId: `bench_${Date.now()}`,
       timestamp: Date.now(),
     }).catch(() => {});
   }
@@ -404,10 +412,15 @@ for (let i = 0; i < 3; i++) {
       await learner.learn({
         task: repeatTask,
         messages: [{ role: "user", content: repeatTask }, { role: "assistant", content: r.response }],
-        outcome: "success",
+        outcome: "unknown",
+        outcomeReason: "",
+        outcomeConfidence: 0,
         budget: { limitUsd: 5, spentUsd: r.costUsd, tokensIn: r.tokensIn, tokensOut: r.tokensOut, llmCalls: 1, toolCalls: 1 },
         durationMs: latencyMs,
         routingPath: "system2",
+        artifacts: [],
+        hitIterationLimit: false,
+        sessionId: `bench_repeat_${Date.now()}`,
         timestamp: Date.now(),
       });
     } catch {}
@@ -471,3 +484,9 @@ if (failed.length > 0) {
 }
 
 console.log(`\n  ${c("dim", "Benchmark complete. Results above.")}\n`);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

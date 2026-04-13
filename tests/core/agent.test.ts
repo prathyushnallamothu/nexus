@@ -249,7 +249,9 @@ describe("NexusAgent: Iteration Limiting", () => {
     });
 
     const result = await agent.run("Run forever");
-    expect(result.budget.llmCalls).toBeLessThanOrEqual(3);
+    expect(result.hitIterationLimit).toBe(true);
+    expect(result.budget.llmCalls).toBeLessThanOrEqual(4); // 3 loop calls + recovery summary
+    expect(result.response).toContain("Reached iteration limit");
   });
 });
 

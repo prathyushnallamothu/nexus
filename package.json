@@ -2,8 +2,12 @@
   "name": "nexus",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "description": "The AI agent that gets smarter and cheaper over time",
   "license": "MIT",
+  "bin": {
+    "nexus": "./apps/cli/dist/index.js"
+  },
   "workspaces": [
     "packages/*",
     "apps/*"
@@ -12,6 +16,12 @@
     "dev": "bun run apps/cli/src/index.ts",
     "build": "bun run --filter '*' build",
     "lint": "tsc --noEmit",
+    "format:check": "bun run scripts/check-format.ts",
+    "test": "bun test",
+    "version:check": "bun run scripts/check-version.ts",
+    "doctor": "bun run apps/cli/src/index.ts doctor",
+    "setup": "bun run apps/cli/src/index.ts setup",
+    "prepack": "bun run build",
     "clean": "rimraf packages/*/dist apps/*/dist"
   },
   "engines": {

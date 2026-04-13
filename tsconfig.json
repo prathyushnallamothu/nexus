@@ -4,9 +4,14 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "paths": {
+      "@nexus/core": ["./packages/core/src/index.ts"],
+      "@nexus/providers": ["./packages/providers/src/index.ts"],
       "@nexus/intelligence": ["./packages/intelligence/src/index.ts"],
       "@nexus/governance": ["./packages/governance/src/index.ts"],
-      "@nexus/protocols": ["./packages/protocols/src/index.ts"]
+      "@nexus/protocols": ["./packages/protocols/src/index.ts"],
+      "@nexus/runtime": ["./packages/runtime/src/index.ts"],
+      "@nexus/gateway": ["./packages/gateway/src/index.ts"],
+      "@nexus/db": ["./packages/db/src/index.ts"]
     },
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",

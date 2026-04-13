@@ -13,6 +13,7 @@ import type {
   AgentConfig,
   AgentContext,
   AgentEvent,
+  AgentRunResult,
   BudgetState,
   EventHandler,
   LLMProvider,
@@ -81,6 +82,8 @@ export class NexusAgent {
   private eventHandlers: EventHandler[] = [];
   private retryConfig: RetryConfig;
   private abortController: AbortController | null = null;
+  /** Set by interrupt() — queued redirect message to surface in run() result */
+  private _redirectMessage: string | null = null;
 
   constructor(options: NexusAgentOptions) {
     this.config = options.config;
@@ -89,6 +92,23 @@ export class NexusAgent {
     if (options.onEvent) {
       this.eventHandlers.push(options.onEvent);
     }
+  }
+
+  /**
+   * Interrupt an in-flight run.
+   *
+   * Aborts the current agent loop via AbortController and optionally queues
+   * a redirect message that the caller should use to re-run the agent.
+   * Safe to call even when no run is active (no-op).
+   */
+  interrupt(redirectMessage?: string): void {
+    this._redirectMessage = redirectMessage ?? null;
+    this.abortController?.abort();
+    this.emit({
+      type: "agent.interrupted",
+      redirectMessage: this._redirectMessage,
+      timestamp: Date.now(),
+    });
   }
 
   /** Subscribe to agent events */
@@ -115,8 +135,11 @@ export class NexusAgent {
   async run(
     userMessage: string,
     sessionMessages: Message[] = [],
-  ): Promise<{ messages: Message[]; response: string; budget: BudgetState }> {
+  ): Promise<AgentRunResult> {
     const sessionId = `session_${Date.now()}`;
+
+    // Reset interrupt state from any prior interrupt() call
+    this._redirectMessage = null;
 
     // Set up SIGINT handling for graceful abort
     this.abortController = new AbortController();
@@ -152,6 +175,12 @@ export class NexusAgent {
           ctx.shouldStop = true;
           ctx.meta["abortReason"] = reason;
         },
+        redirect: (newMessage: string) => {
+          ctx.shouldStop = true;
+          ctx.meta["redirect"] = newMessage;
+          ctx.meta["abortReason"] = "redirected";
+        },
+        artifacts: [],
       };
 
       this.emit({ type: "session.start", sessionId, timestamp: Date.now() });
@@ -188,10 +217,19 @@ export class NexusAgent {
         timestamp: Date.now(),
       });
 
+      // Prefer ctx.redirect() over interrupt() redirect (ctx is more specific)
+      const redirectMsg =
+        (ctx.meta["redirect"] as string | undefined) ??
+        this._redirectMessage ??
+        undefined;
+
       return {
         messages: ctx.messages,
         response,
         budget: ctx.budget,
+        redirect: redirectMsg,
+        artifacts: ctx.artifacts,
+        hitIterationLimit: ctx.meta["hitIterationLimit"] === true,
       };
     } finally {
       // Clean up SIGINT handler
@@ -210,6 +248,7 @@ export class NexusAgent {
    *   - SIGINT-aware abort
    */
   private async agentLoop(ctx: AgentContext): Promise<void> {
+    const startIteration = ctx.iteration;
     while (ctx.iteration < this.config.maxIterations && !ctx.shouldStop) {
       ctx.iteration++;
 
@@ -324,6 +363,80 @@ export class NexusAgent {
           timestamp: Date.now(),
         });
       }
+    }
+
+    // If we exited because maxIterations was hit (not due to shouldStop/abort),
+    // run recovery: ask the agent to summarize partial work.
+    if (!ctx.shouldStop && ctx.iteration >= this.config.maxIterations) {
+      await this.iterationLimitRecovery(ctx);
+    }
+  }
+
+  /**
+   * Iteration-limit recovery.
+   *
+   * Instead of silently stopping, we inject a recovery prompt (tool-free) so
+   * the agent can summarize:
+   *   1. What was accomplished
+   *   2. What remains
+   *   3. Key state the caller needs to continue
+   *
+   * The summary becomes the final response text and is surfaced in the
+   * `iteration.limit` event so the UI can display it and offer continuation.
+   */
+  private async iterationLimitRecovery(ctx: AgentContext): Promise<void> {
+    ctx.meta["hitIterationLimit"] = true;
+    const fallback =
+      `Reached iteration limit (${ctx.iteration}/${this.config.maxIterations}). ` +
+      `Recovery summary unavailable. Last tool calls are in the message history.`;
+
+    const recoveryPrompt: Message = {
+      role: "user",
+      content:
+        "You have reached the maximum number of iterations for this run. " +
+        "Please provide a concise structured summary:\n" +
+        "1. **Accomplished** — what was completed successfully\n" +
+        "2. **Remaining** — what still needs to be done\n" +
+        "3. **State** — any key information needed to continue (file paths, variable values, next command, etc.)\n\n" +
+        "Keep it under 300 words. Do not call any tools.",
+    };
+    ctx.messages.push(recoveryPrompt);
+
+    try {
+      // Tool-free call — pass empty tool schemas so the model can't call tools
+      const recovery = await this.provider.complete(
+        ctx.messages,
+        [], // no tools
+        { maxTokens: 512 },
+      );
+
+      const summary = recovery.content.trim() || fallback;
+      const assistantSummary: Message = { role: "assistant", content: summary };
+      ctx.messages.push(assistantSummary);
+
+      // Update budget for the recovery call
+      ctx.budget.tokensIn += recovery.usage.inputTokens;
+      ctx.budget.tokensOut += recovery.usage.outputTokens;
+      ctx.budget.spentUsd += recovery.usage.costUsd;
+      ctx.budget.llmCalls++;
+
+      this.emit({
+        type: "iteration.limit",
+        iteration: ctx.iteration,
+        maxIterations: this.config.maxIterations,
+        summary,
+        timestamp: Date.now(),
+      });
+    } catch {
+      // Recovery call failed — emit the event with a fallback summary
+      ctx.messages.push({ role: "assistant", content: fallback });
+      this.emit({
+        type: "iteration.limit",
+        iteration: ctx.iteration,
+        maxIterations: this.config.maxIterations,
+        summary: fallback,
+        timestamp: Date.now(),
+      });
     }
   }
 

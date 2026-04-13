@@ -2,8 +2,14 @@
   "name": "@nexus/db",
   "version": "0.1.0",
   "type": "module",
-  "main": "src/schema.ts",
-  "types": "src/schema.ts",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node"
+  },
   "dependencies": {
     "drizzle-orm": "^0.30.0",
     "pg": "^8.11.0"

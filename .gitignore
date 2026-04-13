@@ -13,3 +13,4 @@ dist/
 .nexus-bench
 agent_ideas*.md
 aiagents*.md
+llmwiki.md

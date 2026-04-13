@@ -263,7 +263,7 @@ class PostgresSessionStore {
       .orderBy(desc(sessions.createdAt))
       .limit(limit);
 
-    return rows.map((r) => this._toStored(r, []));
+    return rows.map((r: DbSession) => this._toStored(r, []));
   }
 
   private _toStored(row: DbSession, msgs: any[]): StoredSession {

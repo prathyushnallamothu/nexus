@@ -23,6 +23,13 @@ import {
   processStatusTool,
 } from "../../packages/core/src/tools/terminal.js";
 
+import {
+  initWikiTools,
+  wikiMetadataTool,
+  wikiWriteTool,
+} from "../../packages/core/src/tools/wiki.js";
+import { wikiRecallTool } from "../../packages/core/src/tools/wiki-memory.js";
+
 // ── Filesystem Tools ──────────────────────────────────────
 
 describe("Filesystem Tools", () => {
@@ -44,7 +51,7 @@ describe("Filesystem Tools", () => {
       const dir = makeTmp();
       const file = join(dir, "test.txt");
       writeFileSync(file, "hello world", "utf-8");
-      
+
       const result = await readFileTool.execute({ path: file });
       expect(result).toBe("hello world");
     });
@@ -162,6 +169,58 @@ describe("Filesystem Tools", () => {
       const result = await searchFilesTool.execute({ pattern: "zzzzz", path: dir });
       expect(result).toContain("No matches");
     });
+  });
+});
+
+// ── Wiki Tools ───────────────────────────────────────────
+
+describe("Wiki Tools", () => {
+  it("should persist structured metadata and return citations in recall", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "nexus-test-wiki-"));
+    try {
+      initWikiTools(dir);
+      await wikiWriteTool.execute({
+        page: "projects/nexus/decisions.md",
+        content: [
+          "# Nexus Decisions",
+          "",
+          "> Durable architecture decisions for Nexus.",
+          "",
+          "Updated: 2026-04-13",
+          "",
+          "Nexus stores structured memory metadata in sidecar JSON files.",
+        ].join("\n"),
+        metadata: {
+          type: "project_decision",
+          confidence: 0.92,
+          tags: ["nexus", "memory"],
+          project: "nexus",
+          citations: [{
+            sourceType: "session",
+            sourcePath: "/tmp/raw-session.md",
+            sourceId: "session-abc",
+            quote: "Use sidecar JSON metadata for wiki memory.",
+            timestamp: "2026-04-13T00:00:00.000Z",
+          }],
+        },
+      });
+
+      const metadata = await wikiMetadataTool.execute({
+        action: "get",
+        page: "projects/nexus/decisions.md",
+      });
+      const recall = await wikiRecallTool.execute({
+        query: "sidecar JSON metadata",
+      });
+
+      expect(metadata).toContain('"type": "project_decision"');
+      expect(metadata).toContain('"confidence": 0.92');
+      expect(metadata).toContain('"sourceId": "session-abc"');
+      expect(recall).toContain("Metadata: `project_decision`, confidence 92%");
+      expect(recall).toContain("session: `/tmp/raw-session.md#session-abc`");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -33,7 +33,7 @@ export function createCronTools(store: CronStore): Tool[] {
         required: ["name", "schedule", "task"],
       },
     },
-    async execute(args) {
+    async execute(args: Record<string, unknown>) {
       const job = store.add({
         name: String(args.name),
         schedule: String(args.schedule),
@@ -53,7 +53,7 @@ export function createCronTools(store: CronStore): Tool[] {
       description: "List all scheduled cron jobs with their status and next run times.",
       parameters: { type: "object", properties: {} },
     },
-    async execute() {
+    async execute(_args: Record<string, unknown>) {
       const jobs = store.list();
       if (jobs.length === 0) return "No scheduled jobs. Use cron_create to add one.";
 
@@ -79,7 +79,7 @@ export function createCronTools(store: CronStore): Tool[] {
         required: ["id"],
       },
     },
-    async execute(args) {
+    async execute(args: Record<string, unknown>) {
       const removed = store.remove(String(args.id));
       return removed ? `Deleted job ${args.id}.` : `No job found with id ${args.id}.`;
     },
@@ -98,7 +98,7 @@ export function createCronTools(store: CronStore): Tool[] {
         required: ["id", "enabled"],
       },
     },
-    async execute(args) {
+    async execute(args: Record<string, unknown>) {
       const job = store.toggle(String(args.id), Boolean(args.enabled));
       if (!job) return `No job found with id ${args.id}.`;
       return `Job "${job.name}" is now ${job.enabled ? "enabled" : "disabled"}.`;

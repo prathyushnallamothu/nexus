@@ -59,6 +59,32 @@ export interface AgentConfig {
   maxContextTokens: number;
 }
 
+// ── Artifact Tracking ─────────────────────────────────────
+// First-class record of everything the agent does that has side effects.
+
+export type ArtifactType =
+  | "file_read"
+  | "file_write"
+  | "file_patch"
+  | "command_run"
+  | "url_fetched"
+  | "git_op"
+  | "pr_opened"
+  | "shell_output";
+
+export interface ArtifactRecord {
+  type: ArtifactType;
+  /** File path for file operations */
+  path?: string;
+  /** URL for web/network operations */
+  url?: string;
+  /** Command text for shell operations */
+  command?: string;
+  /** Short summary or first line of output */
+  summary?: string;
+  timestamp: number;
+}
+
 // ── Middleware ─────────────────────────────────────────────
 // Context flows through a middleware chain;
 // each middleware can modify context or abort.
@@ -84,6 +110,17 @@ export interface AgentContext {
   shouldStop: boolean;
   /** Abort with a reason */
   abort: (reason: string) => void;
+  /**
+   * Redirect: stop current run and re-enter with a new user message.
+   * Called by interrupt middleware or the agent itself when it realizes it needs
+   * different input to continue.
+   */
+  redirect: (newMessage: string) => void;
+  /**
+   * All artifacts produced this run — files written/read, commands executed,
+   * URLs fetched, git operations performed. Populated by artifactTracker middleware.
+   */
+  artifacts: ArtifactRecord[];
 }
 
 export type NextFn = () => Promise<void>;
@@ -125,7 +162,15 @@ export type AgentEvent =
   | { type: "budget.exceeded"; spentUsd: number; limitUsd: number; timestamp: number }
   | { type: "context.compressed"; beforeTokens: number; afterTokens: number; messagesRemoved: number; timestamp: number }
   | { type: "session.end"; reason: string; timestamp: number }
-  | { type: "error"; error: string; timestamp: number };
+  | { type: "error"; error: string; timestamp: number }
+  /** Emitted when the agent hits maxIterations — includes a partial-work summary */
+  | { type: "iteration.limit"; iteration: number; maxIterations: number; summary: string; timestamp: number }
+  /** Emitted when agent.interrupt() is called */
+  | { type: "agent.interrupted"; redirectMessage: string | null; timestamp: number }
+  /** Streaming token delta (emitted by stream-capable providers) */
+  | { type: "stream.delta"; delta: string; accumulated: string; timestamp: number }
+  /** Artifact produced — file written, command run, URL fetched, etc. */
+  | { type: "artifact"; artifact: ArtifactRecord; timestamp: number };
 
 export type EventHandler = (event: AgentEvent) => void;
 
@@ -165,4 +210,22 @@ export interface Session {
   createdAt: number;
   updatedAt: number;
   meta: Record<string, unknown>;
+}
+
+// ── Run Result ────────────────────────────────────────────
+
+export interface AgentRunResult {
+  messages: Message[];
+  response: string;
+  budget: BudgetState;
+  /**
+   * If the agent was redirected (via ctx.redirect() or agent.interrupt()),
+   * this contains the new message to send. The caller should immediately
+   * re-run with this message.
+   */
+  redirect?: string;
+  /** Artifacts produced during this run */
+  artifacts: ArtifactRecord[];
+  /** True if the run stopped due to hitting the iteration limit */
+  hitIterationLimit?: boolean;
 }

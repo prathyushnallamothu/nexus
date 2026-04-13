@@ -13,6 +13,18 @@ export {
   outputScanner,
   timing,
   logger,
+  // Production middleware
+  memoryContextBuilder,
+  createWikiSessionArchiveHook,
+  artifactTracker,
+  toolCompactor,
+  afterAgent,
+  afterAgentHooks,
+  createFallbackProvider,
+  type MemoryContextBuilderOptions,
+  type RetrievedMemorySource,
+  type WikiSessionArchiveOptions,
+  type AfterAgentHook,
 } from "./middleware.js";
 export {
   builtinTools,
@@ -39,12 +51,34 @@ export {
   // System
   notifyTool, clipboardReadTool, clipboardWriteTool, systemInfoTool,
   openUrlTool, zipTool, unzipTool, getEnvTool, systemTools,
+  // Wiki
+  wikiReadTool, wikiWriteTool, wikiLogTool, wikiMetadataTool, wikiSearchTool, wikiListTool,
+  wikiLintTool, wikiIngestTool, wikiSaveSessionTool, wikiTools, initWikiTools,
+  // Wiki memory
+  wikiRecallTool, wikiSimilarTool, wikiObserveTool, wikiMemoryTools,
+  // Task Planner
+  createPlannerTools, initPlannerTools, PlanStore,
 } from "./tools/index.js";
-export type { SearchResult } from "./tools/index.js";
+export type { SearchResult, TaskPlan, PlanStep, StepStatus } from "./tools/index.js";
+// Wiki store + index
+export {
+  WikiStore,
+  type WikiPage,
+  type LintIssue,
+  type MemoryCitation,
+  type MemorySourceType,
+  type MemoryType,
+  type WikiPageMetadata,
+  type WikiPageMetadataInput,
+} from "./wiki.js";
+export { WikiSearchIndex, type FTSResult } from "./wiki-index.js";
 export type {
   AgentConfig,
   AgentContext,
   AgentEvent,
+  AgentRunResult,
+  ArtifactRecord,
+  ArtifactType,
   BudgetState,
   EventHandler,
   LLMProvider,

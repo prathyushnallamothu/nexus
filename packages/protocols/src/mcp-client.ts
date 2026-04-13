@@ -11,7 +11,7 @@ export class McpClientManager {
       command: serverCommand,
       args: serverArgs,
     });
-    
+
     this.client = new Client({
       name: "nexus-mcp-client",
       version: "1.0.0",
@@ -26,7 +26,7 @@ export class McpClientManager {
 
   async getTools(): Promise<Tool[]> {
     const response = await this.client.listTools();
-    
+
     return response.tools.map((mcpTool: any) => ({
       schema: {
         name: mcpTool.name,
@@ -39,11 +39,11 @@ export class McpClientManager {
             name: mcpTool.name,
             arguments: args
           }) as any;
-          
+
           if (result.isError) {
             return JSON.stringify({ error: result.content.map((c: any) => c.type === 'text' ? c.text : '').join('\n') });
           }
-          
+
           return JSON.stringify({ data: result.content.map((c: any) => c.type === 'text' ? c.text : '').join('\n') });
         } catch (err: any) {
           return JSON.stringify({ error: err.message });
